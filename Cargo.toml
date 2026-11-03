@@ -1,0 +1,15 @@
+[package]
+name = "lurker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "An IRC bot that keeps watch over idle users in #purgatory and #FBI_watchlist"
+repository = "https://github.com/wetfish/lurkers"
+license = "MIT"
+
+[dependencies]
+futures-util = { version = "0.3.34", default-features = false }
+irc = { version = "1.1.0", default-features = false, features = ["ctcp", "tls-rust"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["macros", "rt", "signal", "time"] }
+toml = "1.1.8"

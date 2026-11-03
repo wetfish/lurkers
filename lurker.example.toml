@@ -1,0 +1,23 @@
+# lurker's settings. Copy this file to lurker.toml and set irc.server.
+
+[irc]
+# The IRC server. lurker always connects over TLS.
+server = "irc.example.net"
+
+# The server's TLS port.
+port = 6697
+
+# lurker's nick. When it is taken, lurker connects as lurker_ or lurker__
+# and takes its nick back as soon as it is free.
+nick = "lurker"
+
+# The username (ident) and the real name shown in /whois. The username
+# defaults to the nick, and the real name to "lurker".
+#username = "lurker"
+#realname = "lurker"
+
+[rooms]
+# The two rooms lurker keeps watch over. Use other names to test lurker
+# without disturbing the real rooms.
+purgatory = "#purgatory"
+watchlist = "#FBI_watchlist"
