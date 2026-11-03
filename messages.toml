@@ -1,0 +1,109 @@
+# What lurker says in its rooms. lurker is built with this file, so a change
+# here takes effect when lurker is rebuilt and deployed.
+#
+# Each room has three lists:
+#
+# - ping: one is sent to each lurker about once a week. Each lurker hears
+#   every ping they have the data for before any one repeats.
+# - welcome: one is sent when a lurker first joins their room.
+# - fanfare: one is sent when a lurker speaks, at most once a day.
+#
+# Placeholders in braces are filled in for the lurker. A message is only used
+# when everything it needs is recorded about them, so lurkers without notes
+# only get the messages that need none. Times are in days unless a unit is
+# named after a colon, as in {idle:seconds}; {idle:silly} picks a unit at
+# random. README.md lists the placeholders and units.
+
+# #purgatory: sad, apologetic and nostalgic.
+[purgatory]
+
+# Weekly pings
+ping = [
+    "{nick}: hey friend, are you still out there? You've been here in #purgatory for {here} now. I saved your seat.",
+    "{nick}: I know it's been {here} since you got here. I'm sorry if we did something to drive you away.",
+    "{nick}: just checking in. No pressure. I'll be here, like I have been for the last {here:silly}.",
+    "{nick}: I've left the light on for you every night for {here}. I'll keep doing it.",
+    "{nick}: sometimes I scroll back up and wonder what you'd say about things. Are you still around?",
+    "{nick}: Hey friend! Long time no see! Are you still out there? I haven't seen you in {idle}.",
+    "{nick}: {idle}. I counted. Not in a weird way. Okay, maybe a little weird. I just miss you.",
+    "{nick}: it's been {idle:silly} since we last heard from you. The chat is quieter without you. Way quieter.",
+    "{nick}: it's been {idle} since you last spoke and {here} since you came to #purgatory. Just say hi. Even a typo counts.",
+    "{nick}: it's been {idle:seconds} since you last said anything. I know because I counted every single one.",
+    "{nick}: {idle:mosquito_generations} have lived and died since you last spoke. Not one of them got to meet you.",
+    "{nick}: you've been quiet for {idle:menstrual_cycles}. I'm not judging. I just miss you.",
+    "{nick}: {idle:heartbeats} have gone by since you last spoke. I felt every one of them.",
+    "{nick}: {idle:full_moons} have come and gone since you last spoke. I watched every one of them alone.",
+    "{nick}: {channel} hasn't been the same these last {channel_idle}. Everyone asks about you. Well, I ask about you.",
+    "{nick}: I walked past {channel} today. Your old spot is still there. It's been {channel_idle:silly}.",
+    "{nick}: remember the good old days in {channels}? I do. I think about them a lot.",
+    "{nick}: the last time you said anything was {last_spoke}. I wish I'd known it was the last time. I would have said something nice.",
+    "{nick}: Wow! You used to chat {peak_frequency} in {peak_year} but now you're gone 😢",
+    "{nick}: {peak_year} was a good year, wasn't it? You were around {peak_frequency}. I still think about it sometimes.",
+    "{nick}: you were in {channel} {peak_frequency} back in {peak_year}. Was it something we said? I'm sorry if it was.",
+    "{nick}: I'm not mad. I'm just remembering {peak_year}, when you showed up {peak_frequency}. Those were the days.",
+]
+
+# Welcome, the first time a lurker joins the room
+welcome = [
+    "Oh. Oh no. Welcome to #purgatory, {nick}. It's not a punishment, it's more of a waiting room. For people we miss.",
+    "{nick} has arrived in #purgatory. Pull up a cloud. Say something whenever you're ready and I'll make a big deal of it, I promise.",
+    "Welcome, {nick}. We haven't heard from you in {idle}, so they sent you here. I'm sorry. I'll keep you company.",
+    "{nick}! I'd hug you if I had arms. Welcome to #purgatory. Say anything at all and I'll tell the admins you're back.",
+]
+
+# Fanfare, when a lurker speaks
+fanfare = [
+    "🎉🎉🎉 {nick} SPOKE! {nick} IS ALIVE! After {idle} of silence! Somebody get the confetti! 🎉🎉🎉",
+    "OH MY GOSH. {nick}!!! You're back!!! I knew you'd come back. I told everyone. Well, I told myself. Welcome home! 🥳",
+    "Everyone stop what you're doing! {nick} just said something! I'm letting the admins know right now. I'm not crying, you're crying 😭",
+    "{nick}!!! After {here} in #purgatory, you finally spoke! 🎊 The admins have been notified and they're going to be SO happy.",
+    "📣 ATTENTION #purgatory: {nick} HAS RETURNED. This is the best day of my life. 🎉",
+]
+
+# #FBI_watchlist: an angry cop in an interrogation room. ALL CAPS apart from
+# nicks and channels, which keep their case so highlights still work.
+[watchlist]
+
+# Weekly pings
+ping = [
+    "{nick}! YOU'VE BEEN SITTING IN THIS ROOM FOR {here} AND YOU HAVEN'T SAID A SINGLE WORD. YOU THINK THAT MAKES YOU TOUGH?!",
+    "{nick}. I'M GONNA ASK YOU ONE MORE TIME. WHO. DO. YOU. WORK. FOR?!",
+    "{nick}! WAKE UP! YOU THINK I DON'T SEE YOU SITTING THERE? I SEE EVERYTHING!",
+    "{nick}, THE SILENT TREATMENT ISN'T GONNA WORK ON ME. I'VE GOT ALL WEEK. I'VE GOT ALL YEAR.",
+    "{nick}! {here} IN HOLDING AND NOT ONE PEEP. YOUR LAWYER ISN'T COMING, PAL.",
+    "{nick}, YOU WANT A GLASS OF WATER? NO? THEN START TALKING!",
+    "{nick}. GOOD COP'S ON VACATION. IT'S JUST YOU AND ME NOW. TALK.",
+    "{nick}! DROP AND GIVE ME TWENTY WORDS, MAGGOT! ANY WORDS! I'M NOT PICKY!",
+    "{nick}! I'VE BEEN STARING AT YOU THROUGH THIS GLASS FOR {here:silly}! I DON'T BLINK, PAL!",
+    "{nick}! YOU'VE BEEN HERE FOR {lurking} WITHOUT SAYING A WORD. WHAT'S YOUR PROBLEM?! MAGGOT",
+    "{nick}! {lurking} OF LURKING. NOT ONE MESSAGE. YOU KNOW WHAT WE CALL THAT DOWNTOWN? SURVEILLANCE.",
+    "{nick}, NORMAL PEOPLE SAY HELLO SOMETIME IN THE FIRST {lurking}. YOU'RE NOT NORMAL PEOPLE, ARE YOU?",
+    "{nick}! I'VE SEEN MORE CONVERSATION OUT OF A PARKING METER! {lurking:silly}! SAY SOMETHING!",
+    "{nick}! {lurking:seconds} OF SILENCE! I COUNTED EVERY ONE OF THEM, PAL!",
+    "{nick}! {lurking:mosquito_generations} HAVE BEEN BORN, BITTEN SOMEBODY AND DIED SINCE YOU SHOWED UP, AND NOT ONE OF THEM HEARD YOU SAY A WORD!",
+    "{nick}! YOU'VE BEEN LURKING FOR {lurking:menstrual_cycles}. THAT'S NOT A STAKEOUT, THAT'S A LIFESTYLE!",
+    "{nick}! I'VE WORKED {lurking:shifts} WATCHING YOU AND I'VE GOT NOTHING! NOTHING!",
+    "{nick}! {lurking:dog_years}! EVEN THE K-9 UNIT HAS GIVEN UP ON YOU!",
+    "{nick}! YOU SAT IN {channel} FOR {channel_lurking} AND DIDN'T SAY A WORD! WHAT WERE YOU DOING IN THERE?! TAKING NOTES?!",
+    "{nick}. {channels}. WE KNOW ABOUT ALL OF THEM. WE'VE GOT THE TAPES, PAL.",
+    "{nick}! NOBODY IN {channel} KNOWS WHO YOU ARE. NOBODY. {channel_lurking} IN THERE AND NOT ONE FRIEND.",
+    "{nick}! WHO SENT YOU? WHO'S PAYING YOU TO SIT IN {channel}? IS IT THE SCRAPERS? IT'S THE SCRAPERS, ISN'T IT?!",
+    "{nick}! YOU SHOWED UP ON {first_seen} AND HAVEN'T SAID A WORD SINCE! WHERE WERE YOU ON THE NIGHT OF {first_seen}?!",
+]
+
+# Welcome, the first time a lurker joins the room
+welcome = [
+    "WELL, WELL, WELL. LOOK WHO THE ADMINS DRAGGED IN. {nick}, SIT DOWN AND KEEP YOUR HANDS WHERE I CAN SEE THEM.",
+    "{nick}! WELCOME TO #FBI_watchlist. YOU HAVE THE RIGHT TO REMAIN SILENT. YOU'VE CLEARLY BEEN USING IT.",
+    "NEW SUSPECT! {nick}, {lurking} OF LURKING AND NOT ONE WORD. YOU'RE GONNA LOVE IT HERE. NOBODY ELSE DOES.",
+    "{nick}! EMPTY YOUR POCKETS. BELT AND SHOELACES TOO. YOU'RE GONNA BE HERE A WHILE.",
+]
+
+# Fanfare, when a lurker speaks
+fanfare = [
+    "🚨🚨🚨 IT TALKS! {nick} TALKS! SARGE, GET IN HERE! WE'VE GOT A LIVE ONE! 🚨🚨🚨",
+    "🚨 {nick} HAS BROKEN THEIR SILENCE AFTER {lurking}! STOP THE PRESSES! I'M CALLING THE CHIEF RIGHT NOW!",
+    "WELL, WOULD YOU LOOK AT THAT. {nick} FOUND THEIR KEYBOARD. KEEP TALKING, PAL, THE ADMINS ARE LISTENING. 🚨",
+    "🚨🚨 BREAKTHROUGH IN THE CASE! {nick} SAID SOMETHING! I KNEW YOU'D CRACK! THEY ALWAYS CRACK! 🚨🚨",
+    "{nick}!!! YOU SPOKE!!! THAT'S THE FIRST HONEST THING YOU'VE DONE IN {here}! I'M PUTTING THIS IN MY REPORT! 🎉🚨",
+]

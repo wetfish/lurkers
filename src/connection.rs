@@ -1,9 +1,11 @@
 //! Keeps lurker on IRC: connects over TLS, joins both rooms and rejoins them
 //! when needed, takes its nick back when it was taken, reconnects after a
 //! lost connection, and quits with a message when lurker is stopped. Along
-//! the way it follows who is in the rooms, and answers admins.
+//! the way it follows who is in the rooms, answers admins, and talks to the
+//! lurkers: a welcome when they first join their room, fanfare when they
+//! speak, and a ping about once a week.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,8 +17,11 @@ use tokio::time::{self, Instant, MissedTickBehavior};
 use crate::admin;
 use crate::casemap;
 use crate::config::{Room, Settings};
-use crate::db::{Db, NickChange};
+use crate::db::{Db, Lurker, NickChange};
+use crate::messages::{self, Kind, Messages};
 use crate::presence::Presence;
+use crate::rng::Rng;
+use crate::schedule;
 use crate::shutdown::Shutdown;
 
 /// Sent with QUIT when lurker is stopped, which is usually for a deploy.
@@ -34,6 +39,14 @@ const REJOIN_INTERVAL: Duration = Duration::from_secs(60);
 /// How often to check whether the settings file changed.
 const SETTINGS_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often to check whether a lurker's ping is due.
+const PING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// After making a fuss about a lurker speaking, lurker stays quiet about
+/// them for this many seconds, so a lurker who keeps talking isn't drowned
+/// in fanfare and admins aren't flooded with notices.
+const FANFARE_COOLDOWN: i64 = 24 * 3600;
+
 /// The wait before reconnecting, doubled after each attempt up to
 /// `MAX_RETRY_DELAY`.
 const FIRST_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -49,13 +62,13 @@ const STATUS_PREFIXES: &[char] = &['~', '&', '@', '%', '+'];
 
 /// Stays connected, reconnecting whenever the connection is lost, until
 /// lurker is stopped.
-pub async fn run(settings: &mut Settings, db: &Db, shutdown: &mut Shutdown) {
+pub async fn run(settings: &mut Settings, db: &Db, messages: &Messages, shutdown: &mut Shutdown) {
     let mut delay = FIRST_RETRY_DELAY;
 
     loop {
         let started = Instant::now();
 
-        match connect(settings, db, shutdown).await {
+        match connect(settings, db, messages, shutdown).await {
             Ok(()) => return,
             Err(err) => eprintln!("error: {err}"),
         }
@@ -76,7 +89,12 @@ pub async fn run(settings: &mut Settings, db: &Db, shutdown: &mut Shutdown) {
 
 /// Connects once and handles messages until the connection is lost, which
 /// is an error, or lurker is stopped.
-async fn connect(settings: &mut Settings, db: &Db, shutdown: &mut Shutdown) -> Result<(), String> {
+async fn connect(
+    settings: &mut Settings,
+    db: &Db,
+    messages: &Messages,
+    shutdown: &mut Shutdown,
+) -> Result<(), String> {
     let server = settings.config.irc.server.clone();
     eprintln!("Connecting to {server}:{}", settings.config.irc.port);
 
@@ -98,12 +116,12 @@ async fn connect(settings: &mut Settings, db: &Db, shutdown: &mut Shutdown) -> R
 
     client.identify().map_err(|err| describe(&err))?;
     let mut stream = client.stream().map_err(|err| describe(&err))?;
-    let mut session = Session::new(settings, db);
+    let mut session = Session::new(settings, db, messages);
     serve(&client, &mut stream, &mut session, shutdown).await
 }
 
-/// Handles messages, rejoins rooms and rereads the settings until the
-/// connection is lost or lurker is stopped.
+/// Handles messages, rejoins rooms, rereads the settings and sends pings
+/// until the connection is lost or lurker is stopped.
 async fn serve(
     client: &Client,
     stream: &mut ClientStream,
@@ -114,6 +132,8 @@ async fn serve(
     rejoin.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut settings = time::interval(SETTINGS_INTERVAL);
     settings.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut pings = time::interval(PING_INTERVAL);
+    pings.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         let commands = tokio::select! {
@@ -127,6 +147,7 @@ async fn serve(
                 session.check_settings();
                 Vec::new()
             }
+            _ = pings.tick() => session.ping_due(unix_now()),
             () = shutdown.recv() => {
                 quit(client, stream).await;
                 return Ok(());
@@ -210,6 +231,8 @@ fn log_db<T>(result: rusqlite::Result<T>) -> Option<T> {
 struct Session<'a> {
     settings: &'a mut Settings,
     db: &'a Db,
+    messages: &'a Messages,
+    rng: Rng,
     /// lurker's nick on this connection: the configured one, or an
     /// alternative when that was taken
     nick: String,
@@ -219,18 +242,23 @@ struct Session<'a> {
     joined: HashSet<Room>,
     /// Who else is in them
     presence: Presence,
+    /// When lurker last pinged someone in each room, to space pings out
+    last_ping: HashMap<Room, i64>,
 }
 
 impl<'a> Session<'a> {
-    fn new(settings: &'a mut Settings, db: &'a Db) -> Session<'a> {
+    fn new(settings: &'a mut Settings, db: &'a Db, messages: &'a Messages) -> Session<'a> {
         let nick = settings.config.irc.nick.clone();
         Session {
             settings,
             db,
+            messages,
+            rng: Rng::from_clock(),
             nick,
             registered: false,
             joined: HashSet::new(),
             presence: Presence::default(),
+            last_ping: HashMap::new(),
         }
     }
 
@@ -258,6 +286,7 @@ impl<'a> Session<'a> {
                     for name in names.split_whitespace() {
                         let nick = name.trim_start_matches(STATUS_PREFIXES);
                         if !nick.is_empty() && !self.is_own_nick(nick) {
+                            // Being listed is not joining, so nobody is welcomed
                             self.seen(room, nick, false, now);
                         }
                     }
@@ -278,7 +307,7 @@ impl<'a> Session<'a> {
                         self.joined.insert(room);
                         eprintln!("Joined {channel}");
                     } else {
-                        self.seen(room, source, true, now);
+                        commands.extend(self.seen(room, source, true, now));
                     }
                 }
             }
@@ -333,6 +362,14 @@ impl<'a> Session<'a> {
             Command::PRIVMSG(target, text) if self.is_me(target) && !text.starts_with('\u{1}') => {
                 commands.extend(self.private_message(message, text, now));
             }
+            // Someone speaking in one of the rooms, including /me
+            Command::PRIVMSG(target, text)
+                if !text.starts_with('\u{1}') || text.starts_with("\u{1}ACTION") =>
+            {
+                if let Some(room) = self.settings.config.rooms.find(target) {
+                    commands.extend(self.spoke(room, source, text, now));
+                }
+            }
 
             Command::ERROR(text) => eprintln!("Server error: {text}"),
             Command::Response(response, args) if (400..600).contains(&(*response as u16)) => {
@@ -384,13 +421,19 @@ impl<'a> Session<'a> {
         }
 
         eprintln!("{nick}: {text}");
-        let command = text.split_whitespace().next().unwrap_or("");
+        let mut words = text.split_whitespace();
+        let command = words.next().unwrap_or("");
+        let mut commands = Vec::new();
         let lines = if command.eq_ignore_ascii_case("reload") {
             match self.settings.reload(true) {
                 Some(Ok(summary)) => vec![summary],
                 Some(Err(err)) => vec![err],
                 None => Vec::new(),
             }
+        } else if command.eq_ignore_ascii_case("poke") {
+            let (reply, ping) = self.poke(words.next(), words.next().is_some(), now);
+            commands.extend(ping);
+            vec![reply]
         } else {
             let context = admin::Context {
                 db: self.db,
@@ -402,36 +445,182 @@ impl<'a> Session<'a> {
             admin::run(&context, text)
         };
 
-        lines
-            .into_iter()
-            .map(|line| Command::PRIVMSG(nick.clone(), line))
-            .collect()
+        commands.extend(
+            lines
+                .into_iter()
+                .map(|line| Command::PRIVMSG(nick.clone(), line)),
+        );
+        commands
+    }
+
+    /// An admin's `poke <nick>`: the lurker's ping, sent now. Returns the
+    /// reply to the admin, and the ping if one is sent.
+    fn poke(&mut self, nick: Option<&str>, extra: bool, now: i64) -> (String, Option<Command>) {
+        let (Some(nick), false) = (nick, extra) else {
+            return ("Usage: poke <nick>".to_owned(), None);
+        };
+        let Some(lurker) = log_db(self.db.lurker(nick)).flatten() else {
+            return (format!("{nick} isn't marked."), None);
+        };
+        let channel = self.settings.config.rooms.channel(lurker.room).to_owned();
+        if !self.joined.contains(&lurker.room) || !self.presence.contains(lurker.room, &lurker.nick)
+        {
+            return (
+                format!("{} isn't in {channel} right now.", lurker.nick),
+                None,
+            );
+        }
+
+        match self.ping(&lurker, now) {
+            Some(ping) => (format!("Poked {} in {channel}.", lurker.nick), Some(ping)),
+            None => (
+                format!("lurker has nothing to say to {}.", lurker.nick),
+                None,
+            ),
+        }
+    }
+
+    /// Pings lurkers whose weekly ping is due and who are in their room, at
+    /// most one per room every `schedule::ROOM_GAP` seconds. Lurkers who
+    /// have started their time in their room but have no ping yet get one
+    /// scheduled.
+    fn ping_due(&mut self, now: i64) -> Vec<Command> {
+        let Some(lurkers) = log_db(self.db.lurkers()) else {
+            return Vec::new();
+        };
+
+        for lurker in &lurkers {
+            if let (Some(here_since), None) = (lurker.here_since, lurker.next_ping_at) {
+                let at = schedule::first_ping(here_since, now, &mut self.rng);
+                log_db(self.db.set_next_ping(lurker.id, at));
+            }
+        }
+
+        let mut commands = Vec::new();
+        for room in Room::ALL {
+            let spaced = self
+                .last_ping
+                .get(&room)
+                .is_none_or(|&last| now - last >= schedule::ROOM_GAP);
+            if !self.joined.contains(&room) || !spaced {
+                continue;
+            }
+
+            let due = lurkers
+                .iter()
+                .filter(|lurker| {
+                    lurker.room == room
+                        && lurker.next_ping_at.is_some_and(|at| at <= now)
+                        && self.presence.contains(room, &lurker.nick)
+                })
+                .min_by_key(|lurker| lurker.next_ping_at);
+            if let Some(lurker) = due {
+                commands.extend(self.ping(lurker, now));
+            }
+        }
+        commands
+    }
+
+    /// A lurker's ping, a message they haven't heard yet if there is one,
+    /// and schedules their next one.
+    fn ping(&mut self, lurker: &Lurker, now: i64) -> Option<Command> {
+        let used = log_db(self.db.used_pings(lurker.id)).unwrap_or_default();
+        let (template, text) =
+            self.messages
+                .choose(lurker.room, Kind::Ping, lurker, now, &mut self.rng, &used)?;
+
+        // Once they have heard every ping they can, a new round starts
+        if used.contains(&template) {
+            log_db(self.db.clear_used_pings(lurker.id));
+        }
+        log_db(self.db.use_ping(lurker.id, template));
+        log_db(
+            self.db
+                .set_next_ping(lurker.id, schedule::next_ping(now, &mut self.rng)),
+        );
+        self.last_ping.insert(lurker.room, now);
+
+        let channel = self.settings.config.rooms.channel(lurker.room);
+        eprintln!("Pinged {} in {channel}", lurker.nick);
+        Some(Command::PRIVMSG(channel.to_owned(), text))
+    }
+
+    /// Someone spoke in a room. When it is a lurker in their own room, and
+    /// lurker hasn't made a fuss about them in the last day, it plays the
+    /// fanfare and tells the admins what they said.
+    fn spoke(&mut self, room: Room, nick: &str, text: &str, now: i64) -> Vec<Command> {
+        let Some(lurker) = log_db(self.db.lurker(nick)).flatten() else {
+            return Vec::new();
+        };
+        if lurker.room != room
+            || lurker
+                .fanfare_at
+                .is_some_and(|at| now - at < FANFARE_COOLDOWN)
+        {
+            return Vec::new();
+        }
+        log_db(self.db.set_fanfare(lurker.id, now));
+
+        let channel = self.settings.config.rooms.channel(room).to_owned();
+        let mut commands = Vec::new();
+        if let Some((_, fanfare)) =
+            self.messages
+                .choose(room, Kind::Fanfare, &lurker, now, &mut self.rng, &[])
+        {
+            commands.push(Command::PRIVMSG(channel.clone(), fanfare));
+        }
+
+        // Admins who aren't online miss the notice; the server says so
+        let notice = messages::notice(&channel, &lurker, text, now);
+        let admins = &self.settings.config.admins;
+        for admin in admins {
+            commands.push(Command::PRIVMSG(admin.nick.clone(), notice.clone()));
+        }
+        eprintln!(
+            "Lurker {} spoke in {channel}; told {} admins",
+            lurker.nick,
+            admins.len()
+        );
+        commands
     }
 
     /// Someone is in a room: they joined it, or the list of names had them.
-    /// A lurker in their own room starts their time there the first time.
-    fn seen(&mut self, room: Room, nick: &str, joined: bool, now: i64) {
+    /// A lurker in their own room starts their time there the first time,
+    /// and is welcomed if that is because they joined it. Returns the
+    /// welcome, if any.
+    fn seen(&mut self, room: Room, nick: &str, joined: bool, now: i64) -> Option<Command> {
         self.presence.add(room, nick);
 
-        let Some(lurker) = log_db(self.db.lurker(nick)).flatten() else {
-            return;
-        };
-        let channel = self.settings.config.rooms.channel(room);
+        let lurker = log_db(self.db.lurker(nick)).flatten()?;
+        let channel = self.settings.config.rooms.channel(room).to_owned();
         if lurker.room != room {
             if joined {
                 let theirs = self.settings.config.rooms.channel(lurker.room);
                 eprintln!("Lurker {nick}, marked for {theirs}, joined {channel}");
             }
-            return;
+            return None;
         }
 
-        if log_db(self.db.arrived(lurker.id, now)) == Some(true) {
-            eprintln!(
-                "Lurker {nick} is in {channel} for the first time; their time there starts now"
-            );
-        } else if joined {
-            eprintln!("Lurker {nick} joined {channel}");
+        if log_db(self.db.arrived(lurker.id, now)) != Some(true) {
+            if joined {
+                eprintln!("Lurker {nick} joined {channel}");
+            }
+            return None;
         }
+        eprintln!("Lurker {nick} is in {channel} for the first time; their time there starts now");
+        if !joined {
+            return None;
+        }
+
+        let lurker = Lurker {
+            here_since: Some(now),
+            ..lurker
+        };
+        let (_, welcome) =
+            self.messages
+                .choose(room, Kind::Welcome, &lurker, now, &mut self.rng, &[])?;
+        eprintln!("Welcomed {nick} to {channel}");
+        Some(Command::PRIVMSG(channel, welcome))
     }
 
     fn departed(&mut self, room: Room, nick: &str, how: &str) {
@@ -505,7 +694,24 @@ impl<'a> Session<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
+
+    const DAY: i64 = 86_400;
+
+    fn messages() -> &'static Messages {
+        static MESSAGES: OnceLock<Messages> = OnceLock::new();
+        MESSAGES.get_or_init(|| Messages::builtin().unwrap())
+    }
+
+    /// The channel and text of a message lurker sends.
+    fn said(command: &Command) -> (&str, &str) {
+        match command {
+            Command::PRIVMSG(target, text) => (target.as_str(), text.as_str()),
+            other => panic!("expected a PRIVMSG, got {other:?}"),
+        }
+    }
 
     fn message(line: &str) -> Message {
         line.parse().unwrap()
@@ -529,7 +735,8 @@ mod tests {
 
     /// A session that has connected as `nick` and joined both rooms.
     fn in_both_rooms<'a>(settings: &'a mut Settings, db: &'a Db, nick: &str) -> Session<'a> {
-        let mut session = Session::new(settings, db);
+        let mut session = Session::new(settings, db, messages());
+        session.rng = Rng::seeded(1);
         let lines = [
             format!(":irc.example.net 001 {nick} :Welcome"),
             format!(":{nick}!lurker@host JOIN #purgatory"),
@@ -547,7 +754,7 @@ mod tests {
     fn waits_for_the_welcome_before_rejoining() {
         let mut settings = Settings::example();
         let db = Db::open_in_memory();
-        let mut session = Session::new(&mut settings, &db);
+        let mut session = Session::new(&mut settings, &db, messages());
         assert!(session.rejoin().is_empty());
 
         feed(&mut session, &[":irc.example.net 001 lurker :Welcome"]);
@@ -688,6 +895,191 @@ mod tests {
         );
         assert!(sent.is_empty());
         assert_eq!(db.lurker("alice").unwrap(), None);
+    }
+
+    #[test]
+    fn welcomes_lurkers_the_first_time_they_join() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        db.mark("alice", Room::Watchlist, false, "rachel", 0)
+            .unwrap();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+
+        let sent = feed(&mut session, &[":alice!~a@h JOIN #FBI_watchlist"]);
+        let [welcome] = sent.as_slice() else {
+            panic!("expected a welcome, got {sent:?}");
+        };
+        let (channel, text) = said(welcome);
+        assert_eq!(channel, "#FBI_watchlist");
+        assert!(text.contains("alice"), "{text}");
+
+        let sent = feed(
+            &mut session,
+            &[
+                ":alice!~a@h PART #FBI_watchlist",
+                ":alice!~a@h JOIN #FBI_watchlist",
+            ],
+        );
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    #[test]
+    fn does_not_welcome_lurkers_already_in_the_room() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        db.mark("alice", Room::Purgatory, false, "rachel", 0)
+            .unwrap();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        let sent = feed(
+            &mut session,
+            &[":irc.example.net 353 lurker = #purgatory :lurker alice"],
+        );
+        assert!(sent.is_empty(), "{sent:?}");
+        assert_eq!(here_since(&db, "alice"), Some(1000));
+    }
+
+    #[test]
+    fn makes_a_fuss_when_a_lurker_speaks_once_a_day() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        db.mark("alice", Room::Purgatory, false, "rachel", 0)
+            .unwrap();
+        db.mark("bob", Room::Watchlist, false, "rachel", 0).unwrap();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        feed(
+            &mut session,
+            &[":alice!~a@h JOIN #purgatory", ":bob!~b@h JOIN #purgatory"],
+        );
+
+        let sent = feed(&mut session, &[":alice!~a@h PRIVMSG #purgatory :hello?"]);
+        let [fanfare, notice] = sent.as_slice() else {
+            panic!("expected fanfare and a notice, got {sent:?}");
+        };
+        assert_eq!(said(fanfare).0, "#purgatory");
+        assert_eq!(
+            said(notice),
+            (
+                "rachel",
+                "#purgatory: alice spoke after 0 days in the room (no notes recorded): \"hello?\""
+            )
+        );
+
+        // Not again the same day, not for someone who isn't a lurker, and
+        // not for a lurker outside their own room
+        let sent = feed(
+            &mut session,
+            &[
+                ":alice!~a@h PRIVMSG #purgatory :anyone?",
+                ":carol!~c@h PRIVMSG #purgatory :hi",
+                ":bob!~b@h PRIVMSG #purgatory :hi",
+            ],
+        );
+        assert!(sent.is_empty(), "{sent:?}");
+
+        let later = session.handle(
+            &message(":alice!~a@h PRIVMSG #purgatory :\u{1}ACTION is back\u{1}"),
+            1000 + DAY,
+        );
+        assert_eq!(later.len(), 2);
+        assert!(said(&later[1]).1.ends_with("\"/me is back\""));
+    }
+
+    #[test]
+    fn pings_lurkers_when_their_ping_is_due() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        db.mark("alice", Room::Purgatory, false, "rachel", 0)
+            .unwrap();
+        db.mark("bob", Room::Purgatory, false, "rachel", 0).unwrap();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        feed(
+            &mut session,
+            &[":alice!~a@h JOIN #purgatory", ":bob!~b@h JOIN #purgatory"],
+        );
+
+        // Their first pings are scheduled 3 to 7 days after joining
+        assert!(session.ping_due(2000).is_empty());
+        let first = db.lurker("alice").unwrap().unwrap().next_ping_at.unwrap();
+        assert!((1000 + 3 * DAY..1000 + 7 * DAY).contains(&first));
+
+        let alice = db.lurker("alice").unwrap().unwrap().id;
+        let bob = db.lurker("bob").unwrap().unwrap().id;
+        db.set_next_ping(alice, 1500).unwrap();
+        db.set_next_ping(bob, 1600).unwrap();
+
+        let sent = session.ping_due(2000);
+        let [ping] = sent.as_slice() else {
+            panic!("expected one ping, got {sent:?}");
+        };
+        let (channel, text) = said(ping);
+        assert_eq!(channel, "#purgatory");
+        assert!(text.starts_with("alice"), "{text}");
+        let next = db.lurker("alice").unwrap().unwrap().next_ping_at.unwrap();
+        assert!(next >= 2000 + 7 * DAY);
+        assert_eq!(db.used_pings(alice).unwrap().len(), 1);
+
+        // Bob waits until the room has been quiet for a while
+        assert!(session.ping_due(2000 + schedule::ROOM_GAP - 1).is_empty());
+        let sent = session.ping_due(2000 + schedule::ROOM_GAP);
+        assert!(said(&sent[0]).1.starts_with("bob"), "{sent:?}");
+    }
+
+    #[test]
+    fn waits_for_lurkers_to_be_in_the_room() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        db.mark("alice", Room::Purgatory, false, "rachel", 0)
+            .unwrap();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        feed(
+            &mut session,
+            &[":alice!~a@h JOIN #purgatory", ":alice!~a@h QUIT :bye"],
+        );
+        let alice = db.lurker("alice").unwrap().unwrap().id;
+        db.set_next_ping(alice, 1500).unwrap();
+
+        assert!(session.ping_due(2000).is_empty());
+        feed(&mut session, &[":alice!~a@h JOIN #purgatory"]);
+        assert_eq!(session.ping_due(3000).len(), 1);
+    }
+
+    #[test]
+    fn admins_can_poke_lurkers() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        db.mark("alice", Room::Purgatory, false, "rachel", 0)
+            .unwrap();
+        db.mark("bob", Room::Purgatory, false, "rachel", 0).unwrap();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        feed(&mut session, &[":alice!~a@h JOIN #purgatory"]);
+
+        let sent = feed(
+            &mut session,
+            &[":rachel!~r@home.example.net PRIVMSG lurker :poke alice"],
+        );
+        let [ping, reply] = sent.as_slice() else {
+            panic!("expected a ping and a reply, got {sent:?}");
+        };
+        assert_eq!(said(ping).0, "#purgatory");
+        assert_eq!(said(reply), ("rachel", "Poked alice in #purgatory."));
+
+        let sent = feed(
+            &mut session,
+            &[
+                ":rachel!~r@home.example.net PRIVMSG lurker :poke bob",
+                ":rachel!~r@home.example.net PRIVMSG lurker :poke carol",
+                ":rachel!~r@home.example.net PRIVMSG lurker :poke",
+            ],
+        );
+        let replies: Vec<&str> = sent.iter().map(|command| said(command).1).collect();
+        assert_eq!(
+            replies,
+            [
+                "bob isn't in #purgatory right now.",
+                "carol isn't marked.",
+                "Usage: poke <nick>"
+            ]
+        );
     }
 
     #[test]

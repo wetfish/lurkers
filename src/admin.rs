@@ -1,6 +1,6 @@
 //! The commands admins send lurker in private messages, to mark lurkers and
-//! record what they know about them. `reload` is handled by the connection,
-//! which holds the settings.
+//! record what they know about them. `reload` and `poke` are handled by the
+//! connection, which holds the settings and sends the rooms' messages.
 
 use chrono::Datelike;
 
@@ -98,6 +98,7 @@ pub fn help(rooms: &Rooms) -> Vec<String> {
         "info <nick>: everything recorded about a lurker".to_owned(),
         "list: every lurker, and who is in their room now".to_owned(),
         "forget <nick>: delete a lurker".to_owned(),
+        "poke <nick>: send a lurker their weekly ping now".to_owned(),
         "reload: read the settings file again".to_owned(),
     ]
 }
@@ -256,6 +257,17 @@ fn info(context: &Context, args: &[&str]) -> Reply {
             .collect();
         lines.extend(wrap("Channels: ", channels));
     }
+
+    lines.push(match (lurker.next_ping_at, lurker.here_since) {
+        (Some(at), _) if at > context.now => format!(
+            "Next ping: around {} (in {}).",
+            dates::today(at),
+            dates::days((at - context.now) / 86_400)
+        ),
+        (Some(_), _) => "Next ping: due, as soon as they're in the room.".to_owned(),
+        (None, Some(_)) => "Next ping: being scheduled.".to_owned(),
+        (None, None) => format!("Next ping: after they first join {channel}."),
+    });
 
     if lurker.room == Room::Purgatory {
         lines.push(match lurker.peak {
@@ -516,6 +528,7 @@ mod tests {
                  Marked by rachel on 2026-11-02.",
                 "Channels: #dryfish last spoke 2026-11-01 (1 day), #wetfish last spoke \
                  2025-11-19 (348 days)",
+                "Next ping: being scheduled.",
                 "Most active: chatted every week in 2022.",
             ]
         );
@@ -527,8 +540,27 @@ mod tests {
                 "bob: untrusted (#FBI_watchlist), not in the room now, not seen there yet. \
                  Marked by rachel on 2026-11-02.",
                 "No channels yet. Add them with: channel bob <#channel> <date>",
+                "Next ping: after they first join #FBI_watchlist.",
             ]
         );
+    }
+
+    #[test]
+    fn shows_when_the_next_ping_comes() {
+        let fixture = Fixture::new();
+        fixture.run("trusted alice");
+        let id = fixture.db.lurker("alice").unwrap().unwrap().id;
+
+        fixture
+            .db
+            .set_next_ping(id, NOW + 3 * 86_400 + 600)
+            .unwrap();
+        let info = fixture.run("info alice");
+        assert_eq!(info[2], "Next ping: around 2026-11-05 (in 3 days).");
+
+        fixture.db.set_next_ping(id, NOW - 60).unwrap();
+        let info = fixture.run("info alice");
+        assert_eq!(info[2], "Next ping: due, as soon as they're in the room.");
     }
 
     #[test]
@@ -571,8 +603,8 @@ mod tests {
             fixture.run("dance"),
             ["I don't know the command dance. Send \"help\" for the list."]
         );
-        assert_eq!(fixture.run("help").len(), 9);
-        assert_eq!(fixture.run("").len(), 9);
+        assert_eq!(fixture.run("help").len(), 10);
+        assert_eq!(fixture.run("").len(), 10);
     }
 
     #[test]

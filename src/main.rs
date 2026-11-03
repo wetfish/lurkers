@@ -4,14 +4,19 @@ mod config;
 mod connection;
 mod dates;
 mod db;
+mod messages;
 mod presence;
+mod rng;
+mod schedule;
 mod shutdown;
+mod units;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::config::Settings;
 use crate::db::Db;
+use crate::messages::Messages;
 use crate::shutdown::Shutdown;
 
 /// The settings file read when none is given. `.gitignore` excludes it.
@@ -63,6 +68,14 @@ async fn main() -> ExitCode {
         }
     };
 
+    let messages = match Messages::builtin() {
+        Ok(messages) => messages,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let mut shutdown = match Shutdown::new() {
         Ok(shutdown) => shutdown,
         Err(err) => {
@@ -71,7 +84,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    connection::run(&mut settings, &db, &mut shutdown).await;
+    connection::run(&mut settings, &db, &messages, &mut shutdown).await;
     ExitCode::SUCCESS
 }
 

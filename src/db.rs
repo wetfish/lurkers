@@ -2,8 +2,9 @@
 //! they survive restarts.
 //!
 //! `lurkers` has one row per marked user, and `lurker_channels` the channels
-//! an admin said each of them idled in. Nobody else is recorded: people in
-//! the rooms who aren't marked are left alone.
+//! an admin said each of them idled in. `used_pings` remembers which ping
+//! messages each lurker has heard. Nobody else is recorded: people in the
+//! rooms who aren't marked are left alone.
 //!
 //! Times are whole seconds since 1970 UTC. In `sqlite3`,
 //! `datetime(marked_at, 'unixepoch')` shows one as a date and time. Dates
@@ -20,7 +21,7 @@ use crate::config::Room;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 1] = [SCHEMA_V1];
+const MIGRATIONS: [&str; 2] = [SCHEMA_V1, SCHEMA_V2];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE lurkers (
@@ -53,6 +54,21 @@ CREATE TABLE lurker_channels (
     -- there, for an untrusted one.
     since TEXT NOT NULL,
     PRIMARY KEY (lurker_id, channel_key)
+);
+";
+
+const SCHEMA_V2: &str = "
+-- When lurker next pings them, once their time in their room has started.
+ALTER TABLE lurkers ADD COLUMN next_ping_at INTEGER;
+-- When lurker last made a fuss about them speaking.
+ALTER TABLE lurkers ADD COLUMN fanfare_at INTEGER;
+
+-- The ping messages each lurker has heard since they last heard them all,
+-- by their number in messages.toml.
+CREATE TABLE used_pings (
+    lurker_id INTEGER NOT NULL REFERENCES lurkers (id) ON DELETE CASCADE,
+    template INTEGER NOT NULL,
+    PRIMARY KEY (lurker_id, template)
 );
 ";
 
@@ -106,6 +122,10 @@ pub struct Lurker {
     pub here_since: Option<i64>,
     pub marked_by: String,
     pub marked_at: i64,
+    /// When lurker next pings them
+    pub next_ping_at: Option<i64>,
+    /// When lurker last made a fuss about them speaking
+    pub fanfare_at: Option<i64>,
 }
 
 /// A channel a lurker idled in.
@@ -206,7 +226,8 @@ impl Db {
     }
 
     /// Marks someone as a lurker for a room. `here` says whether they are in
-    /// that room right now, so their time in it starts counting.
+    /// that room right now, so their time in it starts counting. Moving a
+    /// lurker to the other room starts their time and pings there afresh.
     pub fn mark(
         &self,
         nick: &str,
@@ -230,10 +251,13 @@ impl Db {
             Some((_, current)) if current == room.as_str() => Ok(Marked::Unchanged),
             Some((id, _)) => {
                 self.conn.execute(
-                    "UPDATE lurkers SET room = ?2, here_since = ?3, marked_by = ?4, marked_at = ?5
+                    "UPDATE lurkers
+                     SET room = ?2, here_since = ?3, marked_by = ?4, marked_at = ?5,
+                         next_ping_at = NULL
                      WHERE id = ?1",
                     params![id, room.as_str(), here_since, admin, now],
                 )?;
+                self.clear_used_pings(id)?;
                 Ok(Marked::Moved)
             }
             None => {
@@ -296,6 +320,51 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// Sets when lurker next pings a lurker.
+    pub fn set_next_ping(&self, id: i64, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE lurkers SET next_ping_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    /// The ping messages a lurker has heard since they last heard them all.
+    pub fn used_pings(&self, id: i64) -> rusqlite::Result<Vec<usize>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT template FROM used_pings WHERE lurker_id = ?1")?;
+        let used = statement
+            .query_map([id], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(used.into_iter().map(|template| template as usize).collect())
+    }
+
+    /// Records that a lurker heard a ping message.
+    pub fn use_ping(&self, id: i64, template: usize) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO used_pings (lurker_id, template) VALUES (?1, ?2)",
+            params![id, template as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Starts a lurker's round of ping messages again.
+    pub fn clear_used_pings(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM used_pings WHERE lurker_id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Records that lurker made a fuss about a lurker speaking.
+    pub fn set_fanfare(&self, id: i64, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE lurkers SET fanfare_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
     /// Follows a nick change, if the old nick is a lurker's.
     pub fn rename(&self, old: &str, new: &str) -> rusqlite::Result<NickChange> {
         let (old_key, new_key) = (casemap::fold(old), casemap::fold(new));
@@ -320,7 +389,8 @@ impl Db {
 
     fn load(&self, id: i64) -> rusqlite::Result<Lurker> {
         let mut lurker = self.conn.query_row(
-            "SELECT nick, room, peak_year, peak_frequency, here_since, marked_by, marked_at
+            "SELECT nick, room, peak_year, peak_frequency, here_since, marked_by, marked_at,
+                    next_ping_at, fanfare_at
              FROM lurkers WHERE id = ?1",
             [id],
             |row| {
@@ -337,6 +407,8 @@ impl Db {
                     here_since: row.get(4)?,
                     marked_by: row.get(5)?,
                     marked_at: row.get(6)?,
+                    next_ping_at: row.get(7)?,
+                    fanfare_at: row.get(8)?,
                 })
             },
         )?;
@@ -402,6 +474,63 @@ mod tests {
         assert_eq!(alice.here_since, None);
         assert_eq!(alice.marked_by, "rachel");
         assert_eq!(db.lurker("bob").unwrap(), None);
+    }
+
+    #[test]
+    fn upgrades_a_version_1_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!("{SCHEMA_V1} PRAGMA user_version = 1;"))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO lurkers (nick, nick_key, room, marked_by, marked_at)
+             VALUES ('alice', 'alice', 'purgatory', 'rachel', 100)",
+            [],
+        )
+        .unwrap();
+
+        let db = Db::setup(conn).unwrap();
+        let alice = db.lurker("alice").unwrap().unwrap();
+        assert_eq!(alice.next_ping_at, None);
+        assert_eq!(alice.fanfare_at, None);
+    }
+
+    #[test]
+    fn remembers_pings_and_fanfare() {
+        let db = Db::open_in_memory();
+        db.mark("alice", Room::Purgatory, true, "rachel", 100)
+            .unwrap();
+        let id = db.lurker("alice").unwrap().unwrap().id;
+
+        db.set_next_ping(id, 500).unwrap();
+        db.set_fanfare(id, 600).unwrap();
+        db.use_ping(id, 3).unwrap();
+        db.use_ping(id, 1).unwrap();
+        db.use_ping(id, 3).unwrap();
+
+        let alice = db.lurker("alice").unwrap().unwrap();
+        assert_eq!(alice.next_ping_at, Some(500));
+        assert_eq!(alice.fanfare_at, Some(600));
+        let mut used = db.used_pings(id).unwrap();
+        used.sort();
+        assert_eq!(used, [1, 3]);
+
+        db.clear_used_pings(id).unwrap();
+        assert!(db.used_pings(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn moving_rooms_starts_pings_afresh() {
+        let db = Db::open_in_memory();
+        db.mark("alice", Room::Purgatory, true, "rachel", 100)
+            .unwrap();
+        let id = db.lurker("alice").unwrap().unwrap().id;
+        db.set_next_ping(id, 500).unwrap();
+        db.use_ping(id, 2).unwrap();
+
+        db.mark("alice", Room::Watchlist, false, "rachel", 200)
+            .unwrap();
+        assert_eq!(db.lurker("alice").unwrap().unwrap().next_ping_at, None);
+        assert!(db.used_pings(id).unwrap().is_empty());
     }
 
     #[test]
