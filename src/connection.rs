@@ -1345,7 +1345,7 @@ mod tests {
 
         let sent = feed(
             &mut session,
-            &[&format!("{ADMIN} PRIVMSG lurker :trusted alice 3d")],
+            &[&format!("{ADMIN} PRIVMSG lurker :trusted alice grace=3d")],
         );
         assert_eq!(
             sent,
@@ -1365,7 +1365,7 @@ mod tests {
         let mut session = in_both_rooms(&mut settings, &db, "lurker");
 
         for line in [
-            "PRIVMSG #purgatory :lurker: untrusted bob 1h",
+            "PRIVMSG #purgatory :lurker: untrusted bob grace=1h",
             "PRIVMSG #purgatory :Lurker, list",
             "PRIVMSG #purgatory :lurker forget bob",
         ] {
@@ -1383,9 +1383,9 @@ mod tests {
         let sent = feed(
             &mut session,
             &[
-                ":mallory!~m@h PRIVMSG #purgatory :lurker: untrusted bob 1h",
+                ":mallory!~m@h PRIVMSG #purgatory :lurker: untrusted bob grace=1h",
                 &format!("{ADMIN} PRIVMSG #purgatory :lurkers are untrusted"),
-                &format!("{ADMIN} PRIVMSG #purgatory :untrusted bob 1h"),
+                &format!("{ADMIN} PRIVMSG #purgatory :untrusted bob grace=1h"),
             ],
         );
         assert!(sent.is_empty(), "{sent:?}");
@@ -1413,9 +1413,9 @@ mod tests {
         let sent = feed(
             &mut session,
             &[
-                ":rachel!~r@elsewhere.net PRIVMSG lurker :untrusted alice 1d",
-                ":mallory!~m@home.example.net PRIVMSG lurker :untrusted alice 1d",
-                &format!("{ADMIN} PRIVMSG #purgatory :untrusted alice 1d"),
+                ":rachel!~r@elsewhere.net PRIVMSG lurker :untrusted alice grace=1d",
+                ":mallory!~m@home.example.net PRIVMSG lurker :untrusted alice grace=1d",
+                &format!("{ADMIN} PRIVMSG #purgatory :untrusted alice grace=1d"),
                 &format!("{ADMIN} PRIVMSG lurker :\u{1}VERSION\u{1}"),
                 ":mallory!~m@h INVITE lurker :#music",
             ],

@@ -105,7 +105,7 @@ ping = [
     "{nick}. {channels}. WE KNOW ABOUT ALL OF THEM. WE'VE GOT THE TAPES, PAL.",
     "{nick}! NOBODY IN {channel} KNOWS WHO YOU ARE. NOBODY. {channel_lurking} IN THERE AND NOT ONE FRIEND.",
     "{nick}! WHO SENT YOU? WHO'S PAYING YOU TO SIT IN {channel}? IS IT THE SCRAPERS? IT'S THE SCRAPERS, ISN'T IT?!",
-    "{nick}! YOU SHOWED UP ON {first_seen} AND HAVEN'T SAID A WORD SINCE! WHERE WERE YOU ON THE NIGHT OF {first_seen}?!",
+    "{nick}! NOT ONE WORD SINCE {silent_since}! WHERE WERE YOU ON THE NIGHT OF {silent_since}?!",
 ]
 
 # Welcome, the first time a lurker joins the room

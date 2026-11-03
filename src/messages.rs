@@ -88,18 +88,21 @@ enum Field {
     Here,
     Channel,
     Channels,
-    /// Time since they last spoke in any of their channels
+    /// Time since they went silent: since the most recent of their
+    /// channels' dates
     Idle,
-    /// Time since they last spoke in `Channel`
+    /// Time since they went silent in `Channel`
     ChannelIdle,
+    /// The most recent of their channels' dates
     LastSpoke,
     PeakYear,
     PeakFrequency,
-    /// Time since they were first seen in any of their channels
+    /// The same as `Idle`, for #FBI_watchlist
     Lurking,
-    /// Time since they were first seen in `Channel`
+    /// The same as `ChannelIdle`, for #FBI_watchlist
     ChannelLurking,
-    FirstSeen,
+    /// The same as `LastSpoke`, for #FBI_watchlist
+    SilentSince,
 }
 
 /// The unit a time is said in.
@@ -213,7 +216,7 @@ impl Field {
             "peak_frequency" => Field::PeakFrequency,
             "lurking" => Field::Lurking,
             "channel_lurking" => Field::ChannelLurking,
-            "first_seen" => Field::FirstSeen,
+            "silent_since" => Field::SilentSince,
             _ => return None,
         };
         let purgatory_only = matches!(
@@ -226,7 +229,7 @@ impl Field {
         );
         let watchlist_only = matches!(
             field,
-            Field::Lurking | Field::ChannelLurking | Field::FirstSeen
+            Field::Lurking | Field::ChannelLurking | Field::SilentSince
         );
         match room {
             Room::Purgatory if watchlist_only => None,
@@ -304,8 +307,8 @@ impl Template {
         let Facts { lurker, room, now } = *facts;
         let loud = lurker.room == Room::Watchlist;
         let channel = rng.pick(&lurker.channels);
+        // When they went silent overall: in the channel they spoke in last
         let newest = lurker.channels.iter().map(|idle| idle.since).max();
-        let oldest = lurker.channels.iter().map(|idle| idle.since).min();
         let mut text = String::new();
 
         for part in &self.parts {
@@ -320,13 +323,11 @@ impl Template {
                         Field::Here => time(now - lurker.here_since?),
                         Field::Channel => channel?.channel.clone(),
                         Field::Channels => list(&lurker.channels, loud)?,
-                        Field::Idle => time(seconds_since(newest?, now)),
-                        Field::Lurking => time(seconds_since(oldest?, now)),
+                        Field::Idle | Field::Lurking => time(seconds_since(newest?, now)),
                         Field::ChannelIdle | Field::ChannelLurking => {
                             time(seconds_since(channel?.since, now))
                         }
-                        Field::LastSpoke => shout(&date(newest?), loud),
-                        Field::FirstSeen => shout(&date(oldest?), loud),
+                        Field::LastSpoke | Field::SilentSince => shout(&date(newest?), loud),
                         Field::PeakYear => lurker.peak?.0.to_string(),
                         Field::PeakFrequency => shout(lurker.peak?.1.phrase(), loud),
                     }
@@ -348,20 +349,14 @@ pub fn notice(channel: &str, lurker: &Lurker, said: &str, now: i64) -> String {
         .map(|idle| idle.channel.as_str())
         .collect();
     let newest = lurker.channels.iter().map(|idle| idle.since).max();
-    let oldest = lurker.channels.iter().map(|idle| idle.since).min();
 
-    let details = match (lurker.room, newest, oldest) {
-        (Room::Purgatory, Some(newest), _) => format!(
-            "last spoke {} ago in {}",
+    let details = match newest {
+        Some(newest) => format!(
+            "silent {} in {}",
             days.format(seconds_since(newest, now)),
             names.join(", ")
         ),
-        (Room::Watchlist, _, Some(oldest)) => format!(
-            "lurked {} in {}",
-            days.format(seconds_since(oldest, now)),
-            names.join(", ")
-        ),
-        _ => "no notes recorded".to_owned(),
+        None => "no notes recorded".to_owned(),
     };
 
     format!(
@@ -624,11 +619,11 @@ mod tests {
                 &bob
             )
             .unwrap(),
-            "Alice! YOU'VE BEEN HERE FOR 713 DAYS WITHOUT SAYING A WORD. WHAT'S YOUR PROBLEM?! MAGGOT"
+            "Alice! YOU'VE BEEN HERE FOR 348 DAYS WITHOUT SAYING A WORD. WHAT'S YOUR PROBLEM?! MAGGOT"
         );
         assert_eq!(
-            render("{channels} {first_seen} {lurking:dog_years}", &bob).unwrap(),
-            "#dryfish AND #wetfish NOVEMBER 19, 2024 13 DOG YEARS"
+            render("{channels} {silent_since} {lurking:dog_years}", &bob).unwrap(),
+            "#dryfish AND #wetfish NOVEMBER 19, 2025 6 DOG YEARS"
         );
     }
 
@@ -705,6 +700,8 @@ mod tests {
             ("{nickname}", Room::Purgatory),
             ("{lurking}", Room::Purgatory),
             ("{idle}", Room::Watchlist),
+            ("{first_seen}", Room::Watchlist),
+            ("{silent_since}", Room::Purgatory),
             ("{nick:seconds}", Room::Purgatory),
             ("{room:days}", Room::Purgatory),
             ("{here:fortnightly}", Room::Purgatory),
@@ -752,8 +749,8 @@ mod tests {
         };
         assert_eq!(
             notice("#purgatory", &alice, "hello? is anyone here", NOW),
-            "#purgatory: Alice spoke after 41 days in the room (last spoke 348 days ago in \
-             #wetfish, #dryfish): \"hello? is anyone here\""
+            "#purgatory: Alice spoke after 41 days in the room (silent 348 days in #wetfish, \
+             #dryfish): \"hello? is anyone here\""
         );
 
         let bob = Lurker {
@@ -766,7 +763,7 @@ mod tests {
         };
         assert_eq!(
             notice("#FBI_watchlist", &bob, "\u{1}ACTION waves\u{1}", NOW),
-            "#FBI_watchlist: Alice spoke after 12 days in the room (lurked 180 days in \
+            "#FBI_watchlist: Alice spoke after 12 days in the room (silent 180 days in \
              #wetfish): \"/me waves\""
         );
 

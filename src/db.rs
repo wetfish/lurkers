@@ -51,8 +51,8 @@ CREATE TABLE lurker_channels (
     channel TEXT NOT NULL,
     -- The channel name folded with IRC's case mapping.
     channel_key TEXT NOT NULL,
-    -- When they last spoke there, for a trusted lurker, or were first seen
-    -- there, for an untrusted one.
+    -- When they went silent there: when they last spoke, or were first seen
+    -- if they never spoke.
     since TEXT NOT NULL,
     PRIMARY KEY (lurker_id, channel_key)
 );
@@ -165,8 +165,8 @@ impl Lurker {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IdleChannel {
     pub channel: String,
-    /// When they last spoke there (trusted) or were first seen there
-    /// (untrusted)
+    /// When they went silent there: when they last spoke, or were first seen
+    /// if they never spoke
     pub since: NaiveDate,
 }
 

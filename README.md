@@ -5,10 +5,12 @@ Time to clean up those lurkers.
 `lurker` is an IRC bot that keeps watch over two rooms where IRC admins move
 idle users:
 
-- **#purgatory**, for people who used to be active but haven't been around
-  for a long time. lurker is sad, apologetic and nostalgic here.
+- **#purgatory**, for people the community actually knows, who used to be
+  active but haven't been around for a long time. Admins mark them
+  `trusted`. lurker is sad, apologetic and nostalgic here.
 - **#FBI_watchlist**, for people nobody knows or can vouch for, who may be
-  collecting data. lurker is an angry cop in an interrogation room here.
+  collecting data, even if they have said a few things before. Admins mark
+  them `untrusted`. lurker is an angry cop in an interrogation room here.
 
 The spiritual inspiration is [IdleRPG](https://www.idlerpg.net/), where people
 earned levels by sitting in a channel and saying nothing. lurker doesn't move
@@ -140,13 +142,10 @@ place, so in a channel everyone there sees the answer.
 
 | Command | Does |
 | --- | --- |
-| `trusted <nick> <grace>` | Marks a lurker for #purgatory |
-| `untrusted <nick> <grace>` | Marks a lurker for #FBI_watchlist |
-| `grace <nick> <grace>` | Changes how long after being warned a lurker is kicked from lurker's channels |
-| `channel <nick> <#channel> <date>` | Adds a channel the lurker idled in, or changes its date: when they last spoke there for a trusted lurker, or when they were first seen there for an untrusted one |
-| `unchannel <nick> <#channel>` | Removes a channel |
-| `peak <nick> <year> <daily\|weekly\|monthly>` | Records how often a trusted lurker chatted in the year they were most active |
-| `info <nick>` | Shows everything recorded about a lurker |
+| `trusted <nick> <fields>` | Marks or updates a lurker for #purgatory |
+| `untrusted <nick> <fields>` | Marks or updates a lurker for #FBI_watchlist |
+| `unchannel <nick> <#channel>` | Removes a channel from a lurker |
+| `info <nick>` | Shows everything recorded about a lurker, ending with it all as one command |
 | `list` | Lists the lurkers for each room, marking those in it now with `(here)` |
 | `forget <nick>` | Deletes a lurker |
 | `poke <nick>` | Sends a lurker in their room their weekly ping now, and schedules the next one a week later |
@@ -156,18 +155,42 @@ place, so in a channel everyone there sees the answer.
 | `reload` | Reads the settings file again |
 | `help` | Lists the commands |
 
-Dates are `YYYY-MM-DD`, or a number of days ago such as `348d`, which lurker
-turns into a date so the count keeps growing. Days are counted in UTC. The
-numbers for `channel` and `peak` can come from `wot analyze --nick`.
+### Marking lurkers
 
-A grace period is how long after being warned a lurker is kicked from
-lurker's channels: minutes, hours, days or weeks, such as `90m`, `12h`, `3d`
-or `2w`, or `never`. Marking someone new needs one, so each lurker can be
-given their own. Marking someone already marked can leave it out to keep
-theirs.
+`trusted` and `untrusted` take the nick, then any of these fields, in any
+order:
+
+| Field | Means |
+| --- | --- |
+| `grace=<time>` | How long after a warning lurker kicks them from its [channels](#channels): minutes, hours, days or weeks, such as `90m`, `12h`, `3d` or `2w`, or `never` |
+| `#channel=<date>` | A channel they idled in, and when they went silent there: when they last spoke, or showed up if they never did |
+| `since=<date>` | The date for every channel given without one, as in `since=180d #wetfish #music` |
+| `peak=<year>/<daily\|weekly\|monthly>` | How often a trusted lurker chatted in the year they were most active |
+
+```text
+untrusted bob grace=3d #wetfish=180d #music=95d
+untrusted bob grace=3d since=180d #wetfish #music
+trusted alice grace=7d #wetfish=348d #dryfish=2025-11-19 peak=2022/daily
+```
+
+Dates are `YYYY-MM-DD`, or a number of days ago such as `180d`, which lurker
+turns into a date so the count keeps growing. Days are counted in UTC. The
+numbers can come from `wot analyze --nick`.
+
+Marking someone new needs `grace`, so each lurker can be given their own.
+Marking someone already marked changes only the fields given and keeps the
+rest, so `untrusted bob grace=never` only changes bob's grace period and
+`untrusted bob #irc=30d` only adds a channel. Giving a channel they already
+have changes its date. lurker checks the whole command before changing
+anything, so a mistake anywhere in it changes nothing.
 
 Marking someone already marked for the other room moves them, and their time
-in the room and their pings start again.
+in the room and their pings start again. Their grace period and channels
+stay.
+
+`info` ends with everything recorded about a lurker as one command, such as
+`As one command: untrusted bob grace=3d #music=2026-07-30 #wetfish=2026-05-06`,
+to copy, change and send back.
 
 ## Channels
 
@@ -248,8 +271,8 @@ lurker talks to lurkers in their own room only, and never to anyone else:
 The admin notice looks like this:
 
 ```text
-#purgatory: alice spoke after 41 days in the room (last spoke 348 days ago in #wetfish, #dryfish): "hello? is anyone here"
-#FBI_watchlist: bob spoke after 12 days in the room (lurked 180 days in #wetfish): "uh hi"
+#purgatory: alice spoke after 41 days in the room (silent 348 days in #wetfish, #dryfish): "hello? is anyone here"
+#FBI_watchlist: bob spoke after 12 days in the room (silent 180 days in #wetfish): "uh hi"
 #purgatory: carol spoke after 3 days in the room (no notes recorded): "hey"
 ```
 
@@ -273,14 +296,14 @@ activity.
 | `{here}` | both | Time since they first joined their room |
 | `{channel}` | both | One of their channels, picked at random |
 | `{channels}` | both | All their channels, such as `#wetfish, #music and #dryfish` |
-| `{idle}` | #purgatory | Time since the most recent date they last spoke in any channel |
-| `{channel_idle}` | #purgatory | Time since they last spoke in `{channel}` |
-| `{last_spoke}` | #purgatory | The most recent date they last spoke, such as `March 3, 2025` |
+| `{idle}` | #purgatory | Time since they went silent: since the most recent of their channels' dates |
+| `{channel_idle}` | #purgatory | Time since they went silent in `{channel}` |
+| `{last_spoke}` | #purgatory | The most recent of their channels' dates, such as `March 3, 2025` |
 | `{peak_year}` | #purgatory | The year they were most active |
 | `{peak_frequency}` | #purgatory | `every day`, `every week` or `every month` |
-| `{lurking}` | #FBI_watchlist | Time since the earliest date they were first seen in any channel |
-| `{channel_lurking}` | #FBI_watchlist | Time since they were first seen in `{channel}` |
-| `{first_seen}` | #FBI_watchlist | The earliest date they were first seen |
+| `{lurking}` | #FBI_watchlist | The same as `{idle}` |
+| `{channel_lurking}` | #FBI_watchlist | The same as `{channel_idle}` |
+| `{silent_since}` | #FBI_watchlist | The same as `{last_spoke}` |
 
 In #FBI_watchlist, times, dates and `AND` are in capitals to match the
 shouting. Nicks and channels keep their case, so highlights still work.
@@ -349,7 +372,7 @@ Times are whole seconds since 1970 UTC. In `sqlite3`,
 | `lurker_id` | The lurker |
 | `channel` | The channel, as the admin gave it |
 | `channel_key` | The channel lowercased with IRC's case mapping |
-| `since` | `YYYY-MM-DD`: when they last spoke there (trusted) or were first seen there (untrusted) |
+| `since` | `YYYY-MM-DD`: when they went silent there, which is when they last spoke, or were first seen if they never spoke |
 
 `used_pings` has the ping messages each lurker has heard since they last heard
 every one they can, by `lurker_id` and `template`, the message's position in

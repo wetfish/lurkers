@@ -101,6 +101,18 @@ pub fn length(seconds: i64) -> String {
     }
 }
 
+/// A grace period as admins type it, in the largest of days, hours and
+/// minutes it is a whole number of, such as `3d`, `12h` or `90m`.
+pub fn short(seconds: i64) -> String {
+    if seconds % DAY == 0 {
+        format!("{}d", seconds / DAY)
+    } else if seconds % HOUR == 0 {
+        format!("{}h", seconds / HOUR)
+    } else {
+        format!("{}m", seconds / MINUTE)
+    }
+}
+
 /// Roughly how long a number of seconds is, rounded down to days, hours or
 /// minutes, such as "2 days" or "45 minutes".
 pub fn about(seconds: i64) -> String {
@@ -169,6 +181,17 @@ mod tests {
         assert_eq!(parse_grace("Never"), Ok(None));
         for input in ["", "3", "d", "0m", "3y", "-1d", "400d", "9999999999999w"] {
             assert!(parse_grace(input).is_err(), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn writes_grace_periods_as_admins_type_them() {
+        assert_eq!(short(3 * DAY), "3d");
+        assert_eq!(short(2 * WEEK), "14d");
+        assert_eq!(short(HOUR), "1h");
+        assert_eq!(short(90 * MINUTE), "90m");
+        for seconds in [MINUTE, 90 * MINUTE, 12 * HOUR, 3 * DAY, 2 * WEEK] {
+            assert_eq!(parse_grace(&short(seconds)), Ok(Some(seconds)));
         }
     }
 
