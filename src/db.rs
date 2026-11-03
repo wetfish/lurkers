@@ -3,8 +3,9 @@
 //!
 //! `lurkers` has one row per marked user, and `lurker_channels` the channels
 //! an admin said each of them idled in. `used_pings` remembers which ping
-//! messages each lurker has heard. Nobody else is recorded: people in the
-//! rooms who aren't marked are left alone.
+//! messages each lurker has heard, and `channels` the channels admins asked
+//! lurker to join besides its rooms. Nobody else is recorded: people who
+//! aren't marked are left alone.
 //!
 //! Times are whole seconds since 1970 UTC. In `sqlite3`,
 //! `datetime(marked_at, 'unixepoch')` shows one as a date and time. Dates
@@ -21,7 +22,7 @@ use crate::config::Room;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 2] = [SCHEMA_V1, SCHEMA_V2];
+const MIGRATIONS: [&str; 3] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE lurkers (
@@ -69,6 +70,25 @@ CREATE TABLE used_pings (
     lurker_id INTEGER NOT NULL REFERENCES lurkers (id) ON DELETE CASCADE,
     template INTEGER NOT NULL,
     PRIMARY KEY (lurker_id, template)
+);
+";
+
+const SCHEMA_V3: &str = "
+-- How many seconds after their warning a lurker is kicked from lurker's
+-- channels. NULL means never.
+ALTER TABLE lurkers ADD COLUMN grace INTEGER;
+-- When lurker warned them that they would be kicked.
+ALTER TABLE lurkers ADD COLUMN warned_at INTEGER;
+
+-- The channels admins asked lurker to join besides its rooms, where it warns
+-- and kicks lurkers when it is allowed to.
+CREATE TABLE channels (
+    -- The channel name folded with IRC's case mapping.
+    channel_key TEXT PRIMARY KEY,
+    -- The channel name as the admin gave it.
+    channel TEXT NOT NULL,
+    added_by TEXT NOT NULL,
+    added_at INTEGER NOT NULL
 );
 ";
 
@@ -126,6 +146,19 @@ pub struct Lurker {
     pub next_ping_at: Option<i64>,
     /// When lurker last made a fuss about them speaking
     pub fanfare_at: Option<i64>,
+    /// How many seconds after their warning they are kicked from lurker's
+    /// channels, or None for never
+    pub grace: Option<i64>,
+    /// When lurker warned them that they would be kicked
+    pub warned_at: Option<i64>,
+}
+
+impl Lurker {
+    /// When they are kicked from lurker's channels, once they have been
+    /// warned and have a grace period.
+    pub fn kick_at(&self) -> Option<i64> {
+        Some(self.warned_at? + self.grace?)
+    }
 }
 
 /// A channel a lurker idled in.
@@ -356,6 +389,58 @@ impl Db {
         Ok(())
     }
 
+    /// Sets how long after their warning a lurker is kicked, or None for
+    /// never.
+    pub fn set_grace(&self, id: i64, grace: Option<i64>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE lurkers SET grace = ?2 WHERE id = ?1",
+            params![id, grace],
+        )?;
+        Ok(())
+    }
+
+    /// Records that lurker warned a lurker.
+    pub fn set_warned(&self, id: i64, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE lurkers SET warned_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    /// The channels admins asked lurker to join, by name.
+    pub fn channels(&self) -> rusqlite::Result<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT channel FROM channels ORDER BY channel_key")?;
+        let channels = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(channels)
+    }
+
+    /// Adds a channel for lurker to join. Returns false when it was already
+    /// one of them.
+    pub fn add_channel(&self, channel: &str, admin: &str, now: i64) -> rusqlite::Result<bool> {
+        let added = self.conn.execute(
+            "INSERT INTO channels (channel_key, channel, added_by, added_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (channel_key) DO NOTHING",
+            params![casemap::fold(channel), channel, admin, now],
+        )?;
+        Ok(added > 0)
+    }
+
+    /// Removes a channel lurker joins. Returns false when it wasn't one of
+    /// them.
+    pub fn drop_channel(&self, channel: &str) -> rusqlite::Result<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM channels WHERE channel_key = ?1",
+            [casemap::fold(channel)],
+        )?;
+        Ok(deleted > 0)
+    }
+
     /// Records that lurker made a fuss about a lurker speaking.
     pub fn set_fanfare(&self, id: i64, at: i64) -> rusqlite::Result<()> {
         self.conn.execute(
@@ -390,7 +475,7 @@ impl Db {
     fn load(&self, id: i64) -> rusqlite::Result<Lurker> {
         let mut lurker = self.conn.query_row(
             "SELECT nick, room, peak_year, peak_frequency, here_since, marked_by, marked_at,
-                    next_ping_at, fanfare_at
+                    next_ping_at, fanfare_at, grace, warned_at
              FROM lurkers WHERE id = ?1",
             [id],
             |row| {
@@ -409,6 +494,8 @@ impl Db {
                     marked_at: row.get(6)?,
                     next_ping_at: row.get(7)?,
                     fanfare_at: row.get(8)?,
+                    grace: row.get(9)?,
+                    warned_at: row.get(10)?,
                 })
             },
         )?;
@@ -492,6 +579,38 @@ mod tests {
         let alice = db.lurker("alice").unwrap().unwrap();
         assert_eq!(alice.next_ping_at, None);
         assert_eq!(alice.fanfare_at, None);
+    }
+
+    #[test]
+    fn remembers_grace_and_warnings() {
+        let db = Db::open_in_memory();
+        db.mark("alice", Room::Purgatory, false, "rachel", 100)
+            .unwrap();
+        let id = db.lurker("alice").unwrap().unwrap().id;
+        assert_eq!(db.lurker("alice").unwrap().unwrap().kick_at(), None);
+
+        db.set_grace(id, Some(3600)).unwrap();
+        assert_eq!(db.lurker("alice").unwrap().unwrap().kick_at(), None);
+        db.set_warned(id, 1000).unwrap();
+        let alice = db.lurker("alice").unwrap().unwrap();
+        assert_eq!((alice.grace, alice.warned_at), (Some(3600), Some(1000)));
+        assert_eq!(alice.kick_at(), Some(4600));
+
+        db.set_grace(id, None).unwrap();
+        assert_eq!(db.lurker("alice").unwrap().unwrap().kick_at(), None);
+    }
+
+    #[test]
+    fn keeps_the_channels_to_join() {
+        let db = Db::open_in_memory();
+        assert!(db.add_channel("#Wetfish", "rachel", 100).unwrap());
+        assert!(!db.add_channel("#wetfish", "rachel", 100).unwrap());
+        assert!(db.add_channel("#music", "rachel", 100).unwrap());
+        assert_eq!(db.channels().unwrap(), ["#music", "#Wetfish"]);
+
+        assert!(db.drop_channel("#WETFISH").unwrap());
+        assert!(!db.drop_channel("#wetfish").unwrap());
+        assert_eq!(db.channels().unwrap(), ["#music"]);
     }
 
     #[test]

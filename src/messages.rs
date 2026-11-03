@@ -1,6 +1,6 @@
-//! What lurker says in its rooms: the templates in `messages.toml`, which
-//! are built into lurker, filled in with what is recorded about a lurker.
-//! Also the notice admins get when a lurker speaks.
+//! What lurker says to lurkers: the templates in `messages.toml`, which are
+//! built into lurker, filled in with what is recorded about a lurker. Also
+//! the notices admins get.
 
 use chrono::NaiveDate;
 use serde::Deserialize;
@@ -15,12 +15,25 @@ const BUILTIN: &str = include_str!("../messages.toml");
 /// How much of a lurker's message admins are shown, in characters.
 const QUOTE_LENGTH: usize = 200;
 
-/// The kinds of message in each room.
+/// The kinds of message, each in the voice of the lurker's room.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Kind {
     Ping,
     Welcome,
     Fanfare,
+    /// In a channel lurker can kick from, that the lurker will be kicked
+    Warning,
+    /// The reason given when kicking a lurker
+    Kick,
+}
+
+/// What a message is filled in from.
+pub struct Facts<'a> {
+    pub lurker: &'a Lurker,
+    /// The channel name of the lurker's room
+    pub room: &'a str,
+    /// Seconds since 1970 UTC
+    pub now: i64,
 }
 
 pub struct Messages {
@@ -33,6 +46,8 @@ struct Set {
     ping: Vec<Template>,
     welcome: Vec<Template>,
     fanfare: Vec<Template>,
+    warning: Vec<Template>,
+    kick: Vec<Template>,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +63,8 @@ struct FileSet {
     ping: Vec<String>,
     welcome: Vec<String>,
     fanfare: Vec<String>,
+    warning: Vec<String>,
+    kick: Vec<String>,
 }
 
 struct Template {
@@ -63,6 +80,10 @@ enum Part {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Field {
     Nick,
+    /// The channel name of their room
+    Room,
+    /// Their grace period
+    Grace,
     /// Time since they first joined their room
     Here,
     Channel,
@@ -87,6 +108,9 @@ enum Measure {
     In(&'static Unit),
     /// A unit picked at random each time
     Silly,
+    /// The largest of days, hours and minutes it is a whole number of, such
+    /// as "90 minutes", for a grace period without a unit
+    Exact,
 }
 
 impl Messages {
@@ -112,31 +136,28 @@ impl Messages {
             Kind::Ping => &set.ping,
             Kind::Welcome => &set.welcome,
             Kind::Fanfare => &set.fanfare,
+            Kind::Warning => &set.warning,
+            Kind::Kick => &set.kick,
         }
     }
 
-    /// Picks a message for a lurker in a room, among the templates that
-    /// everything they need is recorded for. Templates in `used` are only
-    /// picked once every other one has been, so a lurker hears them all
-    /// before any repeats. Returns the template's number and the message.
+    /// Picks a message for a lurker, in the voice of their room, among the
+    /// templates that everything they need is recorded for. Templates in
+    /// `used` are only picked once every other one has been, so a lurker
+    /// hears them all before any repeats. Returns the template's number and
+    /// the message.
     pub fn choose(
         &self,
-        room: Room,
         kind: Kind,
-        lurker: &Lurker,
-        now: i64,
+        facts: &Facts,
         rng: &mut Rng,
         used: &[usize],
     ) -> Option<(usize, String)> {
         let rendered: Vec<(usize, String)> = self
-            .templates(room, kind)
+            .templates(facts.lurker.room, kind)
             .iter()
             .enumerate()
-            .filter_map(|(index, template)| {
-                template
-                    .render(room, lurker, now, rng)
-                    .map(|text| (index, text))
-            })
+            .filter_map(|(index, template)| template.render(facts, rng).map(|text| (index, text)))
             .collect();
         let fresh: Vec<(usize, String)> = rendered
             .iter()
@@ -169,6 +190,8 @@ impl Set {
             ping: list("ping", file.ping)?,
             welcome: list("welcome", file.welcome)?,
             fanfare: list("fanfare", file.fanfare)?,
+            warning: list("warning", file.warning)?,
+            kick: list("kick", file.kick)?,
         })
     }
 }
@@ -178,6 +201,8 @@ impl Field {
     fn parse(name: &str, room: Room) -> Option<Field> {
         let field = match name {
             "nick" => Field::Nick,
+            "room" => Field::Room,
+            "grace" => Field::Grace,
             "here" => Field::Here,
             "channel" => Field::Channel,
             "channels" => Field::Channels,
@@ -213,7 +238,12 @@ impl Field {
     fn is_time(self) -> bool {
         matches!(
             self,
-            Field::Here | Field::Idle | Field::ChannelIdle | Field::Lurking | Field::ChannelLurking
+            Field::Here
+                | Field::Grace
+                | Field::Idle
+                | Field::ChannelIdle
+                | Field::Lurking
+                | Field::ChannelLurking
         )
     }
 }
@@ -244,6 +274,7 @@ impl Template {
                 )
             })?;
             let measure = match unit {
+                None if field == Field::Grace => Measure::Exact,
                 None => Measure::In(units::days()),
                 Some(_) if !field.is_time() => {
                     return Err(format!("{{{inside}}}: only times can name a unit"));
@@ -269,8 +300,9 @@ impl Template {
 
     /// The message for a lurker, or None when it needs something that isn't
     /// recorded about them.
-    fn render(&self, room: Room, lurker: &Lurker, now: i64, rng: &mut Rng) -> Option<String> {
-        let loud = room == Room::Watchlist;
+    fn render(&self, facts: &Facts, rng: &mut Rng) -> Option<String> {
+        let Facts { lurker, room, now } = *facts;
+        let loud = lurker.room == Room::Watchlist;
         let channel = rng.pick(&lurker.channels);
         let newest = lurker.channels.iter().map(|idle| idle.since).max();
         let oldest = lurker.channels.iter().map(|idle| idle.since).min();
@@ -283,6 +315,8 @@ impl Template {
                     let mut time = |seconds: i64| shout(&duration(seconds, *measure, rng), loud);
                     match field {
                         Field::Nick => lurker.nick.clone(),
+                        Field::Room => room.to_owned(),
+                        Field::Grace => time(lurker.grace?),
                         Field::Here => time(now - lurker.here_since?),
                         Field::Channel => channel?.channel.clone(),
                         Field::Channels => list(&lurker.channels, loud)?,
@@ -337,6 +371,17 @@ pub fn notice(channel: &str, lurker: &Lurker, said: &str, now: i64) -> String {
     )
 }
 
+/// The notice admins get when a lurker was kicked and invited to their room
+/// but hasn't joined it.
+pub fn not_joined(lurker: &Lurker, room: &str, channels: &[String]) -> String {
+    format!(
+        "{nick} was kicked from {} for lurking and invited to {room}, but hasn't joined it. \
+         Sajoin them: /sajoin {nick} {room}",
+        channels.join(", "),
+        nick = lurker.nick
+    )
+}
+
 /// A lurker's message as admins are shown it: an action as `/me`, and cut
 /// short when it is long.
 fn quote(said: &str) -> String {
@@ -356,6 +401,7 @@ fn quote(said: &str) -> String {
 /// 2, so messages never say "0 dog years" or "1 full moons".
 fn duration(seconds: i64, measure: Measure, rng: &mut Rng) -> String {
     let unit = match measure {
+        Measure::Exact => return crate::dates::length(seconds),
         Measure::In(unit) => unit,
         Measure::Silly => {
             let fitting: Vec<&'static Unit> = units::UNITS
@@ -410,6 +456,14 @@ mod tests {
     /// 2026-11-02 12:00 UTC
     const NOW: i64 = 1_793_620_800;
 
+    const KINDS: [Kind; 5] = [
+        Kind::Ping,
+        Kind::Welcome,
+        Kind::Fanfare,
+        Kind::Warning,
+        Kind::Kick,
+    ];
+
     fn day(text: &str) -> NaiveDate {
         NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
     }
@@ -426,6 +480,8 @@ mod tests {
             marked_at: NOW - 41 * DAY,
             next_ping_at: None,
             fanfare_at: None,
+            grace: Some(3 * DAY),
+            warned_at: None,
         }
     }
 
@@ -447,21 +503,38 @@ mod tests {
         }
     }
 
-    fn render(text: &str, room: Room, lurker: &Lurker) -> Option<String> {
-        Template::parse(text, room)
+    fn facts(lurker: &Lurker) -> Facts<'_> {
+        let room = match lurker.room {
+            Room::Purgatory => "#purgatory",
+            Room::Watchlist => "#FBI_watchlist",
+        };
+        Facts {
+            lurker,
+            room,
+            now: NOW,
+        }
+    }
+
+    fn render(text: &str, lurker: &Lurker) -> Option<String> {
+        Template::parse(text, lurker.room)
             .unwrap()
-            .render(room, lurker, NOW, &mut Rng::seeded(1))
+            .render(&facts(lurker), &mut Rng::seeded(1))
     }
 
     #[test]
     fn the_builtin_messages_are_valid() {
         let messages = Messages::builtin().unwrap();
-        assert_eq!(messages.purgatory.ping.len(), 22);
-        assert_eq!(messages.purgatory.welcome.len(), 4);
-        assert_eq!(messages.purgatory.fanfare.len(), 5);
-        assert_eq!(messages.watchlist.ping.len(), 23);
-        assert_eq!(messages.watchlist.welcome.len(), 4);
-        assert_eq!(messages.watchlist.fanfare.len(), 5);
+        let count = |room, kind| messages.templates(room, kind).len();
+        assert_eq!(count(Room::Purgatory, Kind::Ping), 22);
+        assert_eq!(count(Room::Purgatory, Kind::Welcome), 4);
+        assert_eq!(count(Room::Purgatory, Kind::Fanfare), 5);
+        assert_eq!(count(Room::Purgatory, Kind::Warning), 3);
+        assert_eq!(count(Room::Purgatory, Kind::Kick), 3);
+        assert_eq!(count(Room::Watchlist, Kind::Ping), 23);
+        assert_eq!(count(Room::Watchlist, Kind::Welcome), 4);
+        assert_eq!(count(Room::Watchlist, Kind::Fanfare), 5);
+        assert_eq!(count(Room::Watchlist, Kind::Warning), 3);
+        assert_eq!(count(Room::Watchlist, Kind::Kick), 3);
     }
 
     #[test]
@@ -470,12 +543,15 @@ mod tests {
         let mut rng = Rng::seeded(1);
         for room in Room::ALL {
             let lurker = noted(room);
-            for kind in [Kind::Ping, Kind::Welcome, Kind::Fanfare] {
+            for kind in KINDS {
                 for template in messages.templates(room, kind) {
                     for _ in 0..20 {
-                        let text = template.render(room, &lurker, NOW, &mut rng).unwrap();
+                        let text = template.render(&facts(&lurker), &mut rng).unwrap();
                         assert!(!text.contains(['{', '}']), "{text}");
-                        assert!(text.contains("Alice"), "{text}");
+                        // A kick's reason follows the nick in the kick itself
+                        if kind != Kind::Kick {
+                            assert!(text.contains("Alice"), "{text}");
+                        }
                     }
                 }
             }
@@ -485,14 +561,14 @@ mod tests {
     #[test]
     fn lurkers_without_notes_only_get_messages_that_need_none() {
         let messages = Messages::builtin().unwrap();
-        let mut rng = Rng::seeded(1);
         let count = |room| {
+            let bare = lurker(room);
             messages
                 .templates(room, Kind::Ping)
                 .iter()
                 .filter(|template| {
                     template
-                        .render(room, &lurker(room), NOW, &mut Rng::seeded(1))
+                        .render(&facts(&bare), &mut Rng::seeded(1))
                         .is_some()
                 })
                 .count()
@@ -500,35 +576,30 @@ mod tests {
         assert_eq!(count(Room::Purgatory), 5);
         assert_eq!(count(Room::Watchlist), 9);
 
-        let (_, text) = messages
-            .choose(
-                Room::Watchlist,
-                Kind::Fanfare,
-                &lurker(Room::Watchlist),
-                NOW,
-                &mut rng,
-                &[],
-            )
-            .unwrap();
-        assert!(!text.contains('{'), "{text}");
+        // Every kind has something to say to a lurker without notes
+        let mut rng = Rng::seeded(1);
+        for room in Room::ALL {
+            let bare = lurker(room);
+            for kind in KINDS {
+                assert!(
+                    messages
+                        .choose(kind, &facts(&bare), &mut rng, &[])
+                        .is_some()
+                );
+            }
+        }
     }
 
     #[test]
     fn fills_in_purgatory_messages() {
         let alice = noted(Room::Purgatory);
         assert_eq!(
-            render(
-                "{nick}: Hey friend! I haven't seen you in {idle}.",
-                Room::Purgatory,
-                &alice
-            )
-            .unwrap(),
+            render("{nick}: Hey friend! I haven't seen you in {idle}.", &alice).unwrap(),
             "Alice: Hey friend! I haven't seen you in 348 days."
         );
         assert_eq!(
             render(
                 "{nick}: Wow! You used to chat {peak_frequency} in {peak_year} but now you're gone 😢",
-                Room::Purgatory,
                 &alice
             )
             .unwrap(),
@@ -537,7 +608,6 @@ mod tests {
         assert_eq!(
             render(
                 "{channels}; last {last_spoke}; here {here}; {idle:seconds}",
-                Room::Purgatory,
                 &alice
             )
             .unwrap(),
@@ -551,30 +621,45 @@ mod tests {
         assert_eq!(
             render(
                 "{nick}! YOU'VE BEEN HERE FOR {lurking} WITHOUT SAYING A WORD. WHAT'S YOUR PROBLEM?! MAGGOT",
-                Room::Watchlist,
                 &bob
             )
             .unwrap(),
             "Alice! YOU'VE BEEN HERE FOR 713 DAYS WITHOUT SAYING A WORD. WHAT'S YOUR PROBLEM?! MAGGOT"
         );
         assert_eq!(
-            render(
-                "{channels} {first_seen} {lurking:dog_years}",
-                Room::Watchlist,
-                &bob
-            )
-            .unwrap(),
+            render("{channels} {first_seen} {lurking:dog_years}", &bob).unwrap(),
             "#dryfish AND #wetfish NOVEMBER 19, 2024 13 DOG YEARS"
         );
     }
 
     #[test]
+    fn fills_in_the_room_and_grace() {
+        let alice = lurker(Room::Purgatory);
+        assert_eq!(
+            render("{nick}: {room} in {grace}, or {grace:hours}", &alice).unwrap(),
+            "Alice: #purgatory in 3 days, or 72 hours"
+        );
+        let bob = lurker(Room::Watchlist);
+        assert_eq!(
+            render("{room} IN {grace}", &bob).unwrap(),
+            "#FBI_watchlist IN 3 DAYS"
+        );
+        let hour = Lurker {
+            grace: Some(3600),
+            ..lurker(Room::Purgatory)
+        };
+        assert_eq!(render("{grace}", &hour).unwrap(), "1 hour");
+        let never = Lurker { grace: None, ..bob };
+        assert_eq!(render("{grace}", &never), None);
+    }
+
+    #[test]
     fn a_channel_and_its_time_match() {
         let alice = noted(Room::Purgatory);
+        let template = Template::parse("{channel} {channel_idle}", Room::Purgatory).unwrap();
         for seed in 0..20 {
-            let text = Template::parse("{channel} {channel_idle}", Room::Purgatory)
-                .unwrap()
-                .render(Room::Purgatory, &alice, NOW, &mut Rng::seeded(seed))
+            let text = template
+                .render(&facts(&alice), &mut Rng::seeded(seed))
                 .unwrap();
             assert!(
                 text == "#dryfish 348 days" || text == "#wetfish 713 days",
@@ -586,10 +671,10 @@ mod tests {
     #[test]
     fn silly_units_come_to_at_least_two() {
         let alice = noted(Room::Purgatory);
+        let template = Template::parse("{here:silly}", Room::Purgatory).unwrap();
         for seed in 0..50 {
-            let text = Template::parse("{here:silly}", Room::Purgatory)
-                .unwrap()
-                .render(Room::Purgatory, &alice, NOW, &mut Rng::seeded(seed))
+            let text = template
+                .render(&facts(&alice), &mut Rng::seeded(seed))
                 .unwrap();
             let count: i64 = text
                 .split(' ')
@@ -605,13 +690,13 @@ mod tests {
     #[test]
     fn skips_messages_missing_data() {
         let alice = lurker(Room::Purgatory);
-        assert_eq!(render("{idle}", Room::Purgatory, &alice), None);
-        assert_eq!(render("{peak_year}", Room::Purgatory, &alice), None);
+        assert_eq!(render("{idle}", &alice), None);
+        assert_eq!(render("{peak_year}", &alice), None);
         let unseen = Lurker {
             here_since: None,
             ..alice
         };
-        assert_eq!(render("{here}", Room::Purgatory, &unseen), None);
+        assert_eq!(render("{here}", &unseen), None);
     }
 
     #[test]
@@ -621,6 +706,7 @@ mod tests {
             ("{lurking}", Room::Purgatory),
             ("{idle}", Room::Watchlist),
             ("{nick:seconds}", Room::Purgatory),
+            ("{room:days}", Room::Purgatory),
             ("{here:fortnightly}", Room::Purgatory),
             ("{nick", Room::Purgatory),
             ("nick}", Room::Purgatory),
@@ -637,14 +723,14 @@ mod tests {
         let mut used = Vec::new();
         for _ in 0..5 {
             let (index, _) = messages
-                .choose(Room::Purgatory, Kind::Ping, &alice, NOW, &mut rng, &used)
+                .choose(Kind::Ping, &facts(&alice), &mut rng, &used)
                 .unwrap();
             assert!(!used.contains(&index));
             used.push(index);
         }
         // All five that need no notes are used, so one of them repeats
         let (index, _) = messages
-            .choose(Room::Purgatory, Kind::Ping, &alice, NOW, &mut rng, &used)
+            .choose(Kind::Ping, &facts(&alice), &mut rng, &used)
             .unwrap();
         assert!(used.contains(&index));
     }
@@ -689,5 +775,16 @@ mod tests {
         let text = notice("#purgatory", &carol, &long, NOW);
         assert!(text.contains("(no notes recorded)"), "{text}");
         assert!(text.ends_with("a…\""), "{text}");
+    }
+
+    #[test]
+    fn tells_admins_who_needs_sajoining() {
+        let bob = lurker(Room::Watchlist);
+        let channels = ["#wetfish".to_owned(), "#music".to_owned()];
+        assert_eq!(
+            not_joined(&bob, "#FBI_watchlist", &channels),
+            "Alice was kicked from #wetfish, #music for lurking and invited to #FBI_watchlist, \
+             but hasn't joined it. Sajoin them: /sajoin Alice #FBI_watchlist"
+        );
     }
 }

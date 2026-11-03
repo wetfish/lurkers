@@ -1,6 +1,7 @@
-//! The commands admins send lurker in private messages, to mark lurkers and
-//! record what they know about them. `reload` and `poke` are handled by the
-//! connection, which holds the settings and sends the rooms' messages.
+//! The commands admins send lurker, in private messages or in a channel
+//! after its nick, to mark lurkers and record what they know about them.
+//! `reload`, `poke`, `join`, `part` and `channels` are handled by the
+//! connection, which holds the settings and knows the channels.
 
 use chrono::Datelike;
 
@@ -55,6 +56,7 @@ pub fn run(context: &Context, text: &str) -> Vec<String> {
     let reply = match command.to_ascii_lowercase().as_str() {
         "trusted" => mark(context, args, Room::Purgatory),
         "untrusted" => mark(context, args, Room::Watchlist),
+        "grace" => grace(context, args),
         "channel" => channel(context, args),
         "unchannel" => unchannel(context, args),
         "peak" => peak(context, args),
@@ -85,8 +87,11 @@ pub fn help(rooms: &Rooms) -> Vec<String> {
     let purgatory = rooms.channel(Room::Purgatory);
     let watchlist = rooms.channel(Room::Watchlist);
     vec![
-        format!("trusted <nick>: mark a lurker for {purgatory}"),
-        format!("untrusted <nick>: mark a lurker for {watchlist}"),
+        format!("trusted <nick> <grace>: mark a lurker for {purgatory}"),
+        format!("untrusted <nick> <grace>: mark a lurker for {watchlist}"),
+        "grace <nick> <grace>: how long after being warned a lurker is kicked from my channels, \
+         such as 90m, 12h, 3d or 2w, or never"
+            .to_owned(),
         "channel <nick> <#channel> <date>: a channel they idled in, with when they last spoke \
          there (trusted) or were first seen there (untrusted), as YYYY-MM-DD or a number of \
          days ago such as 348d"
@@ -99,27 +104,44 @@ pub fn help(rooms: &Rooms) -> Vec<String> {
         "list: every lurker, and who is in their room now".to_owned(),
         "forget <nick>: delete a lurker".to_owned(),
         "poke <nick>: send a lurker their weekly ping now".to_owned(),
+        "join <#channel>: join a channel, where I warn and kick lurkers once I have +h or +o. \
+         Inviting me does the same"
+            .to_owned(),
+        "part <#channel>: leave a channel".to_owned(),
+        "channels: the channels I'm in, and where I can kick".to_owned(),
         "reload: read the settings file again".to_owned(),
     ]
 }
 
 fn mark(context: &Context, args: &[&str], room: Room) -> Reply {
-    let usage = if room == Room::Purgatory {
-        "Usage: trusted <nick>"
-    } else {
-        "Usage: untrusted <nick>"
-    };
-    let [nick] = args else {
-        return Err(usage.to_owned().into());
+    let trust = trust(room);
+    let (nick, grace) = match args {
+        [nick] => (*nick, None),
+        [nick, grace] => (*nick, Some(dates::parse_grace(grace)?)),
+        _ => return Err(format!("Usage: {trust} <nick> <grace>").into()),
     };
     let nick = check_nick(nick)?;
+    if grace.is_none() && context.db.lurker(nick)?.is_none() {
+        return Err(format!(
+            "Give a grace period too, such as: {trust} {nick} 3d. It is how long after being \
+             warned they are kicked from my channels, or never."
+        )
+        .into());
+    }
 
     let channel = context.rooms.channel(room);
-    let trust = trust(room);
-    let here = context.presence.contains(room, nick);
+    let here = context.presence.contains(channel, nick);
     let marked = context
         .db
         .mark(nick, room, here, context.admin, context.now)?;
+    let grace_sentence = match grace {
+        Some(grace) => {
+            let id = find(context, nick)?.id;
+            context.db.set_grace(id, grace)?;
+            format!(" {}.", capitalize(&kicked(grace)))
+        }
+        None => String::new(),
+    };
 
     let mut reply = match marked {
         Marked::New => format!("{nick} is marked {trust} ({channel})."),
@@ -130,16 +152,32 @@ fn mark(context: &Context, args: &[&str], room: Room) -> Reply {
         ),
         Marked::Unchanged => {
             return Ok(vec![format!(
-                "{nick} is already marked {trust} ({channel})."
+                "{nick} is already marked {trust} ({channel}).{grace_sentence}"
             )]);
         }
     };
+    reply.push_str(&grace_sentence);
     if !here {
         reply.push_str(&format!(
             " Their time in {channel} starts counting when they join it."
         ));
     }
     Ok(vec![reply])
+}
+
+fn grace(context: &Context, args: &[&str]) -> Reply {
+    let [nick, grace] = args else {
+        return Err(
+            "Usage: grace <nick> <grace>, where grace is such as 90m, 12h, 3d or 2w, \
+                    or never"
+                .to_owned()
+                .into(),
+        );
+    };
+    let lurker = find(context, nick)?;
+    let grace = dates::parse_grace(grace)?;
+    context.db.set_grace(lurker.id, grace)?;
+    Ok(vec![format!("{}: {}.", lurker.nick, kicked(grace))])
 }
 
 fn channel(context: &Context, args: &[&str]) -> Reply {
@@ -217,7 +255,7 @@ fn info(context: &Context, args: &[&str]) -> Reply {
     let channel = context.rooms.channel(lurker.room);
     let name = &lurker.nick;
 
-    let here = context.presence.contains(lurker.room, name);
+    let here = context.presence.contains(channel, name);
     let time = match lurker.here_since {
         Some(since) => format!(
             "{} since first seen there",
@@ -269,6 +307,23 @@ fn info(context: &Context, args: &[&str]) -> Reply {
         (None, None) => format!("Next ping: after they first join {channel}."),
     });
 
+    lines.push(match (lurker.grace, lurker.kick_at()) {
+        (None, _) => "Kicks: never kicked from my channels.".to_owned(),
+        (Some(grace), None) => format!(
+            "Kicks: warned when I see them in a channel where I can kick, and kicked {} later.",
+            dates::length(grace)
+        ),
+        (Some(_), Some(at)) if at > context.now => format!(
+            "Kicks: warned on {}, kicked from my channels in {}.",
+            dates::today(lurker.warned_at.unwrap_or(at)),
+            dates::about(at - context.now)
+        ),
+        (Some(_), Some(_)) => format!(
+            "Kicks: warned on {}, kicked from my channels on sight.",
+            dates::today(lurker.warned_at.unwrap_or_default())
+        ),
+    });
+
     if lurker.room == Room::Purgatory {
         lines.push(match lurker.peak {
             Some((year, frequency)) => {
@@ -291,7 +346,10 @@ fn list(context: &Context) -> Reply {
             .iter()
             .filter(|lurker| lurker.room == room)
             .map(|lurker| {
-                if context.presence.contains(room, &lurker.nick) {
+                if context
+                    .presence
+                    .contains(context.rooms.channel(room), &lurker.nick)
+                {
                     format!("{} (here)", lurker.nick)
                 } else {
                     lurker.nick.clone()
@@ -341,6 +399,26 @@ fn check_channel(channel: &str) -> Result<&str, Problem> {
         return Err(format!("{channel} isn't a channel. Channels start with #.").into());
     }
     Ok(channel)
+}
+
+/// How a lurker is kicked, such as "kicked from my channels 3 days after
+/// being warned".
+fn kicked(grace: Option<i64>) -> String {
+    match grace {
+        Some(grace) => format!(
+            "kicked from my channels {} after being warned",
+            dates::length(grace)
+        ),
+        None => "never kicked from my channels".to_owned(),
+    }
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 fn trust(room: Room) -> &'static str {
@@ -395,6 +473,7 @@ mod tests {
 
     /// 2026-11-02 12:00 UTC
     const NOW: i64 = 1_793_620_800;
+    const DAY: i64 = 86_400;
 
     struct Fixture {
         db: Db,
@@ -426,17 +505,20 @@ mod tests {
     #[test]
     fn marks_lurkers() {
         let mut fixture = Fixture::new();
-        fixture.presence.add(Room::Purgatory, "alice");
+        fixture.presence.add("#purgatory", "alice");
 
         assert_eq!(
-            fixture.run("trusted alice"),
-            ["alice is marked trusted (#purgatory)."]
+            fixture.run("trusted alice 3d"),
+            [
+                "alice is marked trusted (#purgatory). Kicked from my channels 3 days after being \
+              warned."
+            ]
         );
         assert_eq!(
-            fixture.run("UNTRUSTED bob"),
+            fixture.run("UNTRUSTED bob never"),
             [
-                "bob is marked untrusted (#FBI_watchlist). Their time in #FBI_watchlist starts \
-                 counting when they join it."
+                "bob is marked untrusted (#FBI_watchlist). Never kicked from my channels. Their \
+                 time in #FBI_watchlist starts counting when they join it."
             ]
         );
         assert_eq!(
@@ -454,13 +536,59 @@ mod tests {
         let alice = fixture.db.lurker("alice").unwrap().unwrap();
         assert_eq!(alice.here_since, Some(NOW));
         assert_eq!(alice.marked_by, "rachel");
+        assert_eq!(alice.grace, Some(3 * DAY));
+        assert_eq!(fixture.db.lurker("bob").unwrap().unwrap().grace, None);
+    }
+
+    #[test]
+    fn needs_a_grace_period_to_mark_someone_new() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            fixture.run("trusted alice"),
+            [
+                "Give a grace period too, such as: trusted alice 3d. It is how long after being \
+                 warned they are kicked from my channels, or never."
+            ]
+        );
+        assert_eq!(fixture.db.lurker("alice").unwrap(), None);
+        assert_eq!(
+            fixture.run("trusted alice soon"),
+            [
+                "soon isn't a grace period. Give one in minutes, hours, days or weeks, such as \
+                 90m, 12h, 3d or 2w, or never"
+            ]
+        );
+        assert_eq!(fixture.run("trusted"), ["Usage: trusted <nick> <grace>"]);
+    }
+
+    #[test]
+    fn changes_grace_periods() {
+        let fixture = Fixture::new();
+        fixture.run("untrusted bob 3d");
+
+        assert_eq!(
+            fixture.run("grace bob 12h"),
+            ["bob: kicked from my channels 12 hours after being warned."]
+        );
+        assert_eq!(
+            fixture.run("untrusted bob 90m"),
+            [
+                "bob is already marked untrusted (#FBI_watchlist). Kicked from my channels 90 \
+              minutes after being warned."
+            ]
+        );
+        assert_eq!(
+            fixture.run("grace bob never"),
+            ["bob: never kicked from my channels."]
+        );
+        assert_eq!(fixture.db.lurker("bob").unwrap().unwrap().grace, None);
     }
 
     #[test]
     fn records_channels() {
         let fixture = Fixture::new();
-        fixture.run("trusted alice");
-        fixture.run("untrusted bob");
+        fixture.run("trusted alice 3d");
+        fixture.run("untrusted bob 3d");
 
         assert_eq!(
             fixture.run("channel alice #wetfish 2024-11-19"),
@@ -491,8 +619,8 @@ mod tests {
     #[test]
     fn records_peak_activity_for_trusted_lurkers() {
         let fixture = Fixture::new();
-        fixture.run("trusted alice");
-        fixture.run("untrusted bob");
+        fixture.run("trusted alice 3d");
+        fixture.run("untrusted bob 3d");
 
         assert_eq!(
             fixture.run("peak alice 2022 Daily"),
@@ -515,8 +643,8 @@ mod tests {
     #[test]
     fn shows_info() {
         let mut fixture = Fixture::new();
-        fixture.presence.add(Room::Purgatory, "alice");
-        fixture.run("trusted alice");
+        fixture.presence.add("#purgatory", "alice");
+        fixture.run("trusted alice 3d");
         fixture.run("channel alice #wetfish 348d");
         fixture.run("channel alice #dryfish 2026-11-01");
         fixture.run("peak alice 2022 weekly");
@@ -529,11 +657,13 @@ mod tests {
                 "Channels: #dryfish last spoke 2026-11-01 (1 day), #wetfish last spoke \
                  2025-11-19 (348 days)",
                 "Next ping: being scheduled.",
+                "Kicks: warned when I see them in a channel where I can kick, and kicked 3 days \
+                 later.",
                 "Most active: chatted every week in 2022.",
             ]
         );
 
-        fixture.run("untrusted bob");
+        fixture.run("untrusted bob never");
         assert_eq!(
             fixture.run("info bob"),
             [
@@ -541,6 +671,7 @@ mod tests {
                  Marked by rachel on 2026-11-02.",
                 "No channels yet. Add them with: channel bob <#channel> <date>",
                 "Next ping: after they first join #FBI_watchlist.",
+                "Kicks: never kicked from my channels.",
             ]
         );
     }
@@ -548,13 +679,10 @@ mod tests {
     #[test]
     fn shows_when_the_next_ping_comes() {
         let fixture = Fixture::new();
-        fixture.run("trusted alice");
+        fixture.run("trusted alice 3d");
         let id = fixture.db.lurker("alice").unwrap().unwrap().id;
 
-        fixture
-            .db
-            .set_next_ping(id, NOW + 3 * 86_400 + 600)
-            .unwrap();
+        fixture.db.set_next_ping(id, NOW + 3 * DAY + 600).unwrap();
         let info = fixture.run("info alice");
         assert_eq!(info[2], "Next ping: around 2026-11-05 (in 3 days).");
 
@@ -564,11 +692,32 @@ mod tests {
     }
 
     #[test]
+    fn shows_when_the_kick_comes() {
+        let fixture = Fixture::new();
+        fixture.run("untrusted bob 3d");
+        let id = fixture.db.lurker("bob").unwrap().unwrap().id;
+
+        fixture.db.set_warned(id, NOW - DAY).unwrap();
+        let info = fixture.run("info bob");
+        assert_eq!(
+            info[3],
+            "Kicks: warned on 2026-11-01, kicked from my channels in 2 days."
+        );
+
+        fixture.db.set_warned(id, NOW - 4 * DAY).unwrap();
+        let info = fixture.run("info bob");
+        assert_eq!(
+            info[3],
+            "Kicks: warned on 2026-10-29, kicked from my channels on sight."
+        );
+    }
+
+    #[test]
     fn lists_lurkers_by_room() {
         let mut fixture = Fixture::new();
-        fixture.presence.add(Room::Purgatory, "carol");
-        fixture.run("trusted carol");
-        fixture.run("trusted alice");
+        fixture.presence.add("#purgatory", "carol");
+        fixture.run("trusted carol 3d");
+        fixture.run("trusted alice 3d");
 
         assert_eq!(
             fixture.run("list"),
@@ -582,7 +731,7 @@ mod tests {
     #[test]
     fn forgets_lurkers() {
         let fixture = Fixture::new();
-        fixture.run("trusted alice");
+        fixture.run("trusted alice 3d");
         assert_eq!(fixture.run("forget alice"), ["Forgot alice."]);
         assert_eq!(fixture.run("forget alice"), ["alice isn't marked."]);
     }
@@ -597,14 +746,16 @@ mod tests {
                  nobody\"."
             ]
         );
-        assert_eq!(fixture.run("trusted"), ["Usage: trusted <nick>"]);
-        assert_eq!(fixture.run("trusted #wetfish"), ["#wetfish isn't a nick."]);
+        assert_eq!(
+            fixture.run("trusted #wetfish 3d"),
+            ["#wetfish isn't a nick."]
+        );
         assert_eq!(
             fixture.run("dance"),
             ["I don't know the command dance. Send \"help\" for the list."]
         );
-        assert_eq!(fixture.run("help").len(), 10);
-        assert_eq!(fixture.run("").len(), 10);
+        assert_eq!(fixture.run("help").len(), 14);
+        assert_eq!(fixture.run("").len(), 14);
     }
 
     #[test]

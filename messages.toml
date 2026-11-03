@@ -7,6 +7,9 @@
 #   every ping they have the data for before any one repeats.
 # - welcome: one is sent when a lurker first joins their room.
 # - fanfare: one is sent when a lurker speaks, at most once a day.
+# - warning: sent once, in a channel lurker can kick from, to say the lurker
+#   will be kicked to their room after their grace period.
+# - kick: the reason given when lurker kicks a lurker from a channel.
 #
 # Placeholders in braces are filled in for the lurker. A message is only used
 # when everything it needs is recorded about them, so lurkers without notes
@@ -60,6 +63,20 @@ fanfare = [
     "📣 ATTENTION #purgatory: {nick} HAS RETURNED. This is the best day of my life. 🎉",
 ]
 
+# Warning, in a channel lurker can kick from
+warning = [
+    "{nick}: hey friend, I'm so sorry to do this, but you've been quiet here for a long time. In {grace} I'll have to walk you over to {room}. I'll save you a seat.",
+    "{nick}: I hate this part. You've been away a while, so in {grace} I'm taking you to {room}, where we keep the people we miss. It's nothing personal, I promise.",
+    "{nick}: just a heads up, friend. In {grace} you'll be moving to {room}. It's quieter there. I'll come visit.",
+]
+
+# Kick reason
+kick = [
+    "Sorry, friend. Come find us in {room}.",
+    "I'll miss you here. See you in {room}.",
+    "It's not goodbye, just see you in {room}.",
+]
+
 # #FBI_watchlist: an angry cop in an interrogation room. ALL CAPS apart from
 # nicks and channels, which keep their case so highlights still work.
 [watchlist]
@@ -106,4 +123,18 @@ fanfare = [
     "WELL, WOULD YOU LOOK AT THAT. {nick} FOUND THEIR KEYBOARD. KEEP TALKING, PAL, THE ADMINS ARE LISTENING. 🚨",
     "🚨🚨 BREAKTHROUGH IN THE CASE! {nick} SAID SOMETHING! I KNEW YOU'D CRACK! THEY ALWAYS CRACK! 🚨🚨",
     "{nick}!!! YOU SPOKE!!! THAT'S THE FIRST HONEST THING YOU'VE DONE IN {here}! I'M PUTTING THIS IN MY REPORT! 🎉🚨",
+]
+
+# Warning, in a channel lurker can kick from
+warning = [
+    "{nick}! YOU'VE BEEN SITTING HERE WITHOUT A WORD AND NOBODY KNOWS WHO YOU ARE. YOU'VE GOT {grace} BEFORE I HAUL YOU DOWN TO {room}.",
+    "{nick}, THIS IS YOUR ONE AND ONLY WARNING. {grace}. THEN YOU'RE COMING WITH ME TO {room}.",
+    "ATTENTION {nick}: YOU ARE BEING WATCHED. IN {grace} YOU'RE GOING TO {room} FOR QUESTIONING.",
+]
+
+# Kick reason
+kick = [
+    "YOU'RE COMING WITH ME. {room}. NOW.",
+    "TIME'S UP, PAL. {room}, DOWNTOWN.",
+    "BOOKED. PROCESSING IN {room}.",
 ]
