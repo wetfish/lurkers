@@ -1,7 +1,7 @@
 //! Keeps lurker on IRC: connects over TLS, joins both rooms and rejoins them
 //! when needed, takes its nick back when it was taken, reconnects after a
 //! lost connection, and quits with a message when lurker is stopped. Along
-//! the way it passes what happens in the rooms on to `presence`.
+//! the way it follows who is in the rooms, and answers admins.
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -9,30 +9,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use irc::client::ClientStream;
-use irc::client::prelude::{
-    Capability, Client, Command, Config as IrcConfig, Message, Prefix, Response,
-};
-use irc::proto::CapSubCommand;
+use irc::client::prelude::{Client, Command, Config as IrcConfig, Message, Prefix, Response};
 use tokio::time::{self, Instant, MissedTickBehavior};
 
+use crate::admin;
 use crate::casemap;
-use crate::config::{Config, Room};
-use crate::db::{Db, Key};
-use crate::presence::{Account, Arrival, Presence, WHOX_TOKEN};
+use crate::config::{Room, Settings};
+use crate::db::{Db, NickChange};
+use crate::presence::Presence;
 use crate::shutdown::Shutdown;
 
 /// Sent with QUIT when lurker is stopped, which is usually for a deploy.
 pub const QUIT_MESSAGE: &str = "brb, getting a software update";
-
-/// The IRCv3 capabilities lurker asks for, each on its own so a server
-/// lacking one still enables the others. extended-join and account-notify
-/// report services accounts, and chghost reports host changes as such
-/// rather than as a quit and a join.
-const CAPABILITIES: [Capability; 3] = [
-    Capability::ExtendedJoin,
-    Capability::AccountNotify,
-    Capability::ChgHost,
-];
 
 /// How long connecting, including the TLS handshake, may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -43,6 +31,9 @@ const QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often to join the rooms lurker is not in, such as after a kick.
 const REJOIN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often to check whether the settings file changed.
+const SETTINGS_INTERVAL: Duration = Duration::from_secs(30);
+
 /// The wait before reconnecting, doubled after each attempt up to
 /// `MAX_RETRY_DELAY`.
 const FIRST_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -52,15 +43,19 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 /// before reconnecting starts again from `FIRST_RETRY_DELAY`.
 const STABLE_CONNECTION: Duration = Duration::from_secs(300);
 
+/// The channel status prefixes the server puts before nicks in its list of
+/// names, such as `@` for an op.
+const STATUS_PREFIXES: &[char] = &['~', '&', '@', '%', '+'];
+
 /// Stays connected, reconnecting whenever the connection is lost, until
 /// lurker is stopped.
-pub async fn run(config: &Config, db: &Db, shutdown: &mut Shutdown) {
+pub async fn run(settings: &mut Settings, db: &Db, shutdown: &mut Shutdown) {
     let mut delay = FIRST_RETRY_DELAY;
 
     loop {
         let started = Instant::now();
 
-        match connect(config, db, shutdown).await {
+        match connect(settings, db, shutdown).await {
             Ok(()) => return,
             Err(err) => eprintln!("error: {err}"),
         }
@@ -81,11 +76,12 @@ pub async fn run(config: &Config, db: &Db, shutdown: &mut Shutdown) {
 
 /// Connects once and handles messages until the connection is lost, which
 /// is an error, or lurker is stopped.
-async fn connect(config: &Config, db: &Db, shutdown: &mut Shutdown) -> Result<(), String> {
-    let server = &config.irc.server;
-    eprintln!("Connecting to {server}:{}", config.irc.port);
+async fn connect(settings: &mut Settings, db: &Db, shutdown: &mut Shutdown) -> Result<(), String> {
+    let server = settings.config.irc.server.clone();
+    eprintln!("Connecting to {server}:{}", settings.config.irc.port);
 
-    let connecting = time::timeout(CONNECT_TIMEOUT, Client::from_config(irc_config(config)));
+    let irc = irc_config(settings);
+    let connecting = time::timeout(CONNECT_TIMEOUT, Client::from_config(irc));
     let mut client = tokio::select! {
         result = connecting => match result {
             Ok(Ok(client)) => client,
@@ -100,22 +96,14 @@ async fn connect(config: &Config, db: &Db, shutdown: &mut Shutdown) -> Result<()
         () = shutdown.recv() => return Ok(()),
     };
 
-    for capability in CAPABILITIES {
-        client
-            .send_cap_req(&[capability])
-            .map_err(|err| describe(&err))?;
-    }
     client.identify().map_err(|err| describe(&err))?;
     let mut stream = client.stream().map_err(|err| describe(&err))?;
-
-    let mut session = Session::new(config, db);
-    let result = serve(&client, &mut stream, &mut session, shutdown).await;
-    session.close(unix_now());
-    result
+    let mut session = Session::new(settings, db);
+    serve(&client, &mut stream, &mut session, shutdown).await
 }
 
-/// Handles messages and rejoins rooms until the connection is lost or
-/// lurker is stopped.
+/// Handles messages, rejoins rooms and rereads the settings until the
+/// connection is lost or lurker is stopped.
 async fn serve(
     client: &Client,
     stream: &mut ClientStream,
@@ -124,6 +112,8 @@ async fn serve(
 ) -> Result<(), String> {
     let mut rejoin = time::interval(REJOIN_INTERVAL);
     rejoin.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut settings = time::interval(SETTINGS_INTERVAL);
+    settings.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         let commands = tokio::select! {
@@ -133,6 +123,10 @@ async fn serve(
                 None => return Err("the server closed the connection".to_owned()),
             },
             _ = rejoin.tick() => session.rejoin(),
+            _ = settings.tick() => {
+                session.check_settings();
+                Vec::new()
+            }
             () = shutdown.recv() => {
                 quit(client, stream).await;
                 return Ok(());
@@ -160,7 +154,8 @@ async fn quit(client: &Client, stream: &mut ClientStream) {
 /// The irc crate's settings for one connection. The crate joins the rooms
 /// once the server has accepted the connection, answers server pings, and
 /// tries the alternative nicks when the nick is taken.
-fn irc_config(config: &Config) -> IrcConfig {
+fn irc_config(settings: &Settings) -> IrcConfig {
+    let config = &settings.config;
     let nick = &config.irc.nick;
 
     IrcConfig {
@@ -203,7 +198,7 @@ fn unix_now() -> i64 {
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
-/// Logs a database error, so a problem with one record doesn't drop the
+/// Logs a database error, so a problem with one lurker doesn't drop the
 /// connection.
 fn log_db<T>(result: rusqlite::Result<T>) -> Option<T> {
     result
@@ -213,7 +208,7 @@ fn log_db<T>(result: rusqlite::Result<T>) -> Option<T> {
 
 /// What lurker knows about its current connection.
 struct Session<'a> {
-    config: &'a Config,
+    settings: &'a mut Settings,
     db: &'a Db,
     /// lurker's nick on this connection: the configured one, or an
     /// alternative when that was taken
@@ -227,11 +222,12 @@ struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    fn new(config: &'a Config, db: &'a Db) -> Session<'a> {
+    fn new(settings: &'a mut Settings, db: &'a Db) -> Session<'a> {
+        let nick = settings.config.irc.nick.clone();
         Session {
-            config,
+            settings,
             db,
-            nick: config.irc.nick.clone(),
+            nick,
             registered: false,
             joined: HashSet::new(),
             presence: Presence::default(),
@@ -241,7 +237,6 @@ impl<'a> Session<'a> {
     /// Updates what lurker knows from a message, and returns the commands
     /// to send in reply.
     fn handle(&mut self, message: &Message, now: i64) -> Vec<Command> {
-        let config = self.config;
         let source = message.source_nickname().unwrap_or("");
         let mut commands = Vec::new();
 
@@ -253,84 +248,66 @@ impl<'a> Session<'a> {
                 self.registered = true;
                 eprintln!("Connected as {}", self.nick);
             }
-            Command::Response(Response::RPL_ISUPPORT, args) => self.presence.isupport(args),
-            Command::CAP(_, subcommand, first, second) => {
-                let capabilities = second.as_deref().or(first.as_deref()).unwrap_or("");
-                match subcommand {
-                    CapSubCommand::ACK => eprintln!("Server enabled {capabilities}"),
-                    CapSubCommand::NAK => eprintln!("Server does not support {capabilities}"),
-                    _ => {}
-                }
-            }
 
             // Who was already in a room when lurker joined it
-            Command::Response(Response::RPL_WHOREPLY, args) => {
-                // <me> <channel> <ident> <host> <server> <nick> <flags> :<hops> <real name>
-                if let [_, channel, ident, host, _, nick, ..] = args.as_slice() {
-                    self.listed(channel, Key::new(nick, ident, host), Account::Unknown, now);
-                }
-            }
-            Command::Raw(code, args) if code == "354" => {
-                // <me> <token> <channel> <ident> <host> <nick> <flags> <account>
-                if let [_, token, channel, ident, host, nick, _, account] = args.as_slice()
-                    && token == WHOX_TOKEN
+            Command::Response(Response::RPL_NAMREPLY, args) => {
+                // <me> <symbol> <channel> :<names>
+                if let [.., channel, names] = args.as_slice()
+                    && let Some(room) = self.settings.config.rooms.find(channel)
                 {
-                    let account = Account::parse(account);
-                    self.listed(channel, Key::new(nick, ident, host), account, now);
+                    for name in names.split_whitespace() {
+                        let nick = name.trim_start_matches(STATUS_PREFIXES);
+                        if !nick.is_empty() && !self.is_own_nick(nick) {
+                            self.seen(room, nick, false, now);
+                        }
+                    }
                 }
             }
-            Command::Response(Response::RPL_ENDOFWHO, args) => {
-                if let Some(room) = args.get(1).and_then(|channel| config.rooms.find(channel)) {
-                    eprintln!(
-                        "{}: {} people besides lurker",
-                        config.rooms.channel(room),
-                        self.presence.count(room)
-                    );
+            Command::Response(Response::RPL_ENDOFNAMES, args) => {
+                if let Some(room) = args
+                    .get(1)
+                    .and_then(|channel| self.settings.config.rooms.find(channel))
+                {
+                    self.log_room(room);
                 }
             }
 
-            Command::JOIN(channels, account, real_name) => {
-                // With extended-join, JOIN also gives the account and real name
-                let account = match (account, real_name) {
-                    (Some(account), Some(_)) => Account::parse(account),
-                    _ => Account::Unknown,
-                };
-                for (room, channel) in rooms_in(config, channels) {
+            Command::JOIN(channels, _, _) => {
+                for (room, channel) in self.rooms_in(channels) {
                     if self.is_me(source) {
                         self.joined.insert(room);
                         eprintln!("Joined {channel}");
-                        commands.push(self.presence.who(channel));
-                    } else if let Some(key) = source_key(message) {
-                        self.arrived(room, key, account, true, now);
+                    } else {
+                        self.seen(room, source, true, now);
                     }
                 }
             }
             Command::PART(channels, _) => {
-                for (room, channel) in rooms_in(config, channels) {
+                for (room, channel) in self.rooms_in(channels) {
                     if self.is_me(source) {
-                        self.lost_room(room, now);
+                        self.lost_room(room);
                         eprintln!("Left {channel}");
                     } else {
-                        self.departed(room, source, "left", now);
+                        self.departed(room, source, "left");
                     }
                 }
             }
             Command::KICK(channels, target, reason) => {
-                for (room, channel) in rooms_in(config, channels) {
+                for (room, channel) in self.rooms_in(channels) {
                     if self.is_me(target) {
-                        self.lost_room(room, now);
+                        self.lost_room(room);
                         eprintln!(
                             "Kicked from {channel} by {source} ({}), rejoining within a minute",
                             reason.as_deref().unwrap_or("no reason")
                         );
                     } else {
-                        self.departed(room, target, "was kicked from", now);
+                        self.departed(room, target, "was kicked from");
                     }
                 }
             }
             Command::QUIT(_) => {
-                if let Some(key) = log_db(self.presence.quit(self.db, source, now)).flatten() {
-                    eprintln!("{key} quit");
+                if !self.presence.quit(source).is_empty() && self.is_lurker(source) {
+                    eprintln!("Lurker {source} quit");
                 }
                 commands.extend(self.reclaim_nick(source));
             }
@@ -339,23 +316,22 @@ impl<'a> Session<'a> {
                 self.nick = new_nick.clone();
             }
             Command::NICK(new_nick) => {
-                let renamed = self.presence.renamed(self.db, source, new_nick, now);
-                if let Some(key) = log_db(renamed).flatten() {
-                    eprintln!("{source} is now {key}");
+                self.presence.rename(source, new_nick);
+                match log_db(self.db.rename(source, new_nick)) {
+                    Some(NickChange::Followed) => eprintln!("Lurker {source} is now {new_nick}"),
+                    Some(NickChange::Taken) => eprintln!(
+                        "Lurker {source} is now {new_nick}, which is another lurker's nick, \
+                         so lurker still knows them as {source}"
+                    ),
+                    _ => {}
                 }
                 commands.extend(self.reclaim_nick(source));
             }
-            Command::CHGHOST(ident, host) => {
-                let changed = self
-                    .presence
-                    .host_changed(self.db, source, ident, host, now);
-                if let Some(key) = log_db(changed).flatten() {
-                    eprintln!("{source} is now {key}");
-                }
-            }
-            Command::ACCOUNT(account) => {
-                let account = Account::parse(account);
-                log_db(self.presence.account_changed(self.db, source, account));
+
+            // Private messages, but not CTCP requests, which the irc crate
+            // answers
+            Command::PRIVMSG(target, text) if self.is_me(target) && !text.starts_with('\u{1}') => {
+                commands.extend(self.private_message(message, text, now));
             }
 
             Command::ERROR(text) => eprintln!("Server error: {text}"),
@@ -378,58 +354,116 @@ impl<'a> Session<'a> {
         Room::ALL
             .into_iter()
             .filter(|room| !self.joined.contains(room))
-            .map(|room| Command::JOIN(self.config.rooms.channel(room).to_owned(), None, None))
+            .map(|room| {
+                Command::JOIN(
+                    self.settings.config.rooms.channel(room).to_owned(),
+                    None,
+                    None,
+                )
+            })
             .collect()
     }
 
-    /// Records the last time everyone was seen in the rooms, since the
-    /// connection has ended.
-    fn close(&mut self, now: i64) {
-        for room in Room::ALL {
-            self.lost_room(room, now);
+    /// Reads the settings file again if it changed, and logs what happened.
+    fn check_settings(&mut self) {
+        match self.settings.reload(false) {
+            Some(Ok(summary)) => eprintln!("{summary}"),
+            Some(Err(err)) => eprintln!("error: {err}"),
+            None => {}
         }
     }
 
-    /// Someone a WHO reply listed in a channel.
-    fn listed(&mut self, channel: &str, key: Key, account: Account, now: i64) {
-        if let Some(room) = self.config.rooms.find(channel) {
-            self.arrived(room, key, account, false, now);
+    /// Answers an admin, or ignores anyone else.
+    fn private_message(&mut self, message: &Message, text: &str, now: i64) -> Vec<Command> {
+        let Some(Prefix::Nickname(nick, _, host)) = &message.prefix else {
+            return Vec::new();
+        };
+        if self.settings.config.admin(nick, host).is_none() {
+            eprintln!("Ignored a private message from {nick} ({host}), who isn't an admin");
+            return Vec::new();
         }
+
+        eprintln!("{nick}: {text}");
+        let command = text.split_whitespace().next().unwrap_or("");
+        let lines = if command.eq_ignore_ascii_case("reload") {
+            match self.settings.reload(true) {
+                Some(Ok(summary)) => vec![summary],
+                Some(Err(err)) => vec![err],
+                None => Vec::new(),
+            }
+        } else {
+            let context = admin::Context {
+                db: self.db,
+                rooms: &self.settings.config.rooms,
+                presence: &self.presence,
+                admin: nick,
+                now,
+            };
+            admin::run(&context, text)
+        };
+
+        lines
+            .into_iter()
+            .map(|line| Command::PRIVMSG(nick.clone(), line))
+            .collect()
     }
 
-    /// Someone is in a room. Joins are logged; people a WHO reply lists are
-    /// only logged when they are new, since a reconnect lists everyone.
-    fn arrived(&mut self, room: Room, key: Key, account: Account, joined: bool, now: i64) {
-        if self.is_lurker(&key.nick) {
+    /// Someone is in a room: they joined it, or the list of names had them.
+    /// A lurker in their own room starts their time there the first time.
+    fn seen(&mut self, room: Room, nick: &str, joined: bool, now: i64) {
+        self.presence.add(room, nick);
+
+        let Some(lurker) = log_db(self.db.lurker(nick)).flatten() else {
+            return;
+        };
+        let channel = self.settings.config.rooms.channel(room);
+        if lurker.room != room {
+            if joined {
+                let theirs = self.settings.config.rooms.channel(lurker.room);
+                eprintln!("Lurker {nick}, marked for {theirs}, joined {channel}");
+            }
             return;
         }
 
-        let channel = self.config.rooms.channel(room);
-        let arrival = self
-            .presence
-            .arrived(self.db, room, key.clone(), account, now);
-        match log_db(arrival) {
-            Some(Arrival::First) => eprintln!("{key} is new in {channel}"),
-            Some(Arrival::Returned) if joined => eprintln!("{key} is back in {channel}"),
-            _ => {}
+        if log_db(self.db.arrived(lurker.id, now)) == Some(true) {
+            eprintln!(
+                "Lurker {nick} is in {channel} for the first time; their time there starts now"
+            );
+        } else if joined {
+            eprintln!("Lurker {nick} joined {channel}");
         }
     }
 
-    fn departed(&mut self, room: Room, nick: &str, how: &str, now: i64) {
-        let channel = self.config.rooms.channel(room);
-        if let Some(key) = log_db(self.presence.departed(self.db, room, nick, now)).flatten() {
-            eprintln!("{key} {how} {channel}");
+    fn departed(&mut self, room: Room, nick: &str, how: &str) {
+        if self.presence.remove(room, nick) && self.is_lurker(nick) {
+            let channel = self.settings.config.rooms.channel(room);
+            eprintln!("Lurker {nick} {how} {channel}");
         }
     }
 
-    fn lost_room(&mut self, room: Room, now: i64) {
+    fn lost_room(&mut self, room: Room) {
         self.joined.remove(&room);
-        log_db(self.presence.lost_room(self.db, room, now));
+        self.presence.clear(room);
+    }
+
+    /// Logs how many people and lurkers are in a room.
+    fn log_room(&self, room: Room) {
+        let lurkers = log_db(self.db.lurkers()).map_or(0, |lurkers| {
+            lurkers
+                .iter()
+                .filter(|lurker| lurker.room == room && self.presence.contains(room, &lurker.nick))
+                .count()
+        });
+        eprintln!(
+            "{}: {} people besides lurker, {lurkers} of them lurkers marked for it",
+            self.settings.config.rooms.channel(room),
+            self.presence.count(room)
+        );
     }
 
     /// Asks for lurker's nick back when whoever had it quit or changed nick.
     fn reclaim_nick(&self, source: &str) -> Option<Command> {
-        let nick = &self.config.irc.nick;
+        let nick = &self.settings.config.irc.nick;
         if !casemap::eq(source, nick) || !self.registered || casemap::eq(&self.nick, nick) {
             return None;
         }
@@ -437,34 +471,35 @@ impl<'a> Session<'a> {
         Some(Command::NICK(nick.clone()))
     }
 
+    /// The channels in a comma-separated list that are lurker's rooms.
+    fn rooms_in<'m>(&self, channels: &'m str) -> Vec<(Room, &'m str)> {
+        channels
+            .split(',')
+            .filter_map(|channel| {
+                self.settings
+                    .config
+                    .rooms
+                    .find(channel)
+                    .map(|room| (room, channel))
+            })
+            .collect()
+    }
+
+    fn is_lurker(&self, nick: &str) -> bool {
+        log_db(self.db.lurker(nick)).flatten().is_some()
+    }
+
     fn is_me(&self, nick: &str) -> bool {
         casemap::eq(nick, &self.nick)
     }
 
-    /// Whether a nick is lurker, or one of the nicks it uses, such as an old
-    /// connection of its own that the server hasn't dropped yet.
-    fn is_lurker(&self, nick: &str) -> bool {
-        let own = &self.config.irc.nick;
+    /// Whether a nick is one lurker itself uses, such as an old connection
+    /// of its own that the server hasn't dropped yet.
+    fn is_own_nick(&self, nick: &str) -> bool {
+        let own = &self.settings.config.irc.nick;
         self.is_me(nick)
             || casemap::eq(nick, own)
             || alt_nicks(own).iter().any(|alt| casemap::eq(nick, alt))
-    }
-}
-
-/// The channels in a comma-separated list that are lurker's rooms.
-fn rooms_in<'c>(config: &'c Config, channels: &'c str) -> impl Iterator<Item = (Room, &'c str)> {
-    channels
-        .split(',')
-        .filter_map(move |channel| config.rooms.find(channel).map(|room| (room, channel)))
-}
-
-/// The nick and `ident@host` a message came from.
-fn source_key(message: &Message) -> Option<Key> {
-    match &message.prefix {
-        Some(Prefix::Nickname(nick, ident, host)) if !ident.is_empty() && !host.is_empty() => {
-            Some(Key::new(nick, ident, host))
-        }
-        _ => None,
     }
 }
 
@@ -480,8 +515,8 @@ mod tests {
         Command::JOIN(room.to_owned(), None, None)
     }
 
-    fn who(room: &str) -> Command {
-        Command::WHO(Some(room.to_owned()), None)
+    fn reply(text: &str) -> Command {
+        Command::PRIVMSG("rachel".to_owned(), text.to_owned())
     }
 
     /// Feeds raw lines to a session, returning what it sends back.
@@ -493,8 +528,8 @@ mod tests {
     }
 
     /// A session that has connected as `nick` and joined both rooms.
-    fn in_both_rooms<'a>(config: &'a Config, db: &'a Db, nick: &str) -> Session<'a> {
-        let mut session = Session::new(config, db);
+    fn in_both_rooms<'a>(settings: &'a mut Settings, db: &'a Db, nick: &str) -> Session<'a> {
+        let mut session = Session::new(settings, db);
         let lines = [
             format!(":irc.example.net 001 {nick} :Welcome"),
             format!(":{nick}!lurker@host JOIN #purgatory"),
@@ -504,11 +539,15 @@ mod tests {
         session
     }
 
+    fn here_since(db: &Db, nick: &str) -> Option<i64> {
+        db.lurker(nick).unwrap().unwrap().here_since
+    }
+
     #[test]
     fn waits_for_the_welcome_before_rejoining() {
-        let config = Config::example();
+        let mut settings = Settings::example();
         let db = Db::open_in_memory();
-        let mut session = Session::new(&config, &db);
+        let mut session = Session::new(&mut settings, &db);
         assert!(session.rejoin().is_empty());
 
         feed(&mut session, &[":irc.example.net 001 lurker :Welcome"]);
@@ -519,188 +558,161 @@ mod tests {
     }
 
     #[test]
-    fn lists_who_is_in_each_room_it_joins() {
-        let config = Config::example();
+    fn reads_the_names_in_a_room() {
+        let mut settings = Settings::example();
         let db = Db::open_in_memory();
-        let mut session = Session::new(&config, &db);
-        let sent = feed(
-            &mut session,
-            &[
-                ":irc.example.net 001 lurker :Welcome",
-                ":lurker!lurker@host JOIN #purgatory",
-                ":Lurker!lurker@host JOIN #FBI_Watchlist",
-            ],
-        );
-        assert_eq!(sent, [who("#purgatory"), who("#FBI_Watchlist")]);
-        assert!(session.rejoin().is_empty());
-    }
+        db.mark("alice", Room::Purgatory, false, "rachel", 0)
+            .unwrap();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker_");
 
-    #[test]
-    fn uses_whox_when_the_server_supports_it() {
-        let config = Config::example();
-        let db = Db::open_in_memory();
-        let mut session = Session::new(&config, &db);
-        let sent = feed(
-            &mut session,
-            &[
-                ":irc.example.net 005 lurker WHOX CHANTYPES=# :are supported by this server",
-                ":irc.example.net 001 lurker :Welcome",
-                ":lurker!lurker@host JOIN #purgatory",
-                ":irc.example.net 354 lurker 152 #purgatory ~a fish-1.chat alice H alice",
-                ":irc.example.net 354 lurker 152 #purgatory ~b fish-2.chat bob H 0",
-                ":irc.example.net 354 lurker 152 #purgatory lurker host lurker H 0",
-                ":irc.example.net 315 lurker #purgatory :End of /WHO list.",
-            ],
-        );
-        assert_eq!(
-            sent,
-            [Command::Raw(
-                "WHO".to_owned(),
-                vec!["#purgatory".to_owned(), "%tcuhnfa,152".to_owned()]
-            )]
-        );
-
-        assert_eq!(session.presence.count(Room::Purgatory), 2);
-        assert_eq!(db.user_count(), 2);
-        let alice = session.presence.user_in(Room::Purgatory, "alice").unwrap();
-        assert_eq!(db.user(alice).1.as_deref(), Some("alice"));
-        let bob = session.presence.user_in(Room::Purgatory, "bob").unwrap();
-        assert_eq!(db.user(bob).1, None);
-    }
-
-    #[test]
-    fn records_people_from_plain_who_replies() {
-        let config = Config::example();
-        let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker");
         feed(
             &mut session,
             &[
-                ":irc.example.net 352 lurker #FBI_watchlist ~a fish-1.chat irc.example.net alice H :0 Alice",
-                ":irc.example.net 352 lurker #wetfish ~c fish-3.chat irc.example.net carol H :0 Carol",
+                ":irc.example.net 353 lurker_ = #purgatory :lurker_ @op +Alice bob lurker",
+                ":irc.example.net 366 lurker_ #purgatory :End of /NAMES list.",
             ],
         );
-        assert_eq!(session.presence.count(Room::Watchlist), 1);
-        assert_eq!(db.user_count(), 1);
+        assert_eq!(session.presence.count(Room::Purgatory), 3);
+        assert!(session.presence.contains(Room::Purgatory, "alice"));
+        assert_eq!(here_since(&db, "alice"), Some(1000));
+        assert_eq!(db.lurker("bob").unwrap(), None);
     }
 
     #[test]
-    fn follows_joins_parts_kicks_and_quits() {
-        let config = Config::example();
+    fn starts_a_lurkers_time_when_they_join_their_room() {
+        let mut settings = Settings::example();
         let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker");
+        db.mark("alice", Room::Purgatory, false, "rachel", 0)
+            .unwrap();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+
+        feed(&mut session, &[":alice!~a@h JOIN #FBI_watchlist"]);
+        assert_eq!(here_since(&db, "alice"), None);
+
+        feed(&mut session, &[":alice!~a@h JOIN #purgatory"]);
+        assert_eq!(here_since(&db, "alice"), Some(1000));
+    }
+
+    #[test]
+    fn follows_people_leaving() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
         feed(
             &mut session,
             &[
-                ":alice!~a@fish-1.chat JOIN #purgatory",
-                ":alice!~a@fish-1.chat JOIN #FBI_watchlist",
-                ":bob!~b@fish-2.chat JOIN #purgatory",
-                ":carol!~c@fish-3.chat JOIN #wetfish",
+                ":alice!~a@h JOIN #purgatory",
+                ":alice!~a@h JOIN #FBI_watchlist",
+                ":bob!~b@h JOIN #purgatory",
+                ":carol!~c@h JOIN #wetfish",
             ],
         );
         assert_eq!(session.presence.count(Room::Purgatory), 2);
-        assert_eq!(session.presence.count(Room::Watchlist), 1);
-        assert_eq!(db.user_count(), 2);
 
         feed(
             &mut session,
             &[
-                ":bob!~b@fish-2.chat PART #purgatory :bye",
+                ":bob!~b@h PART #purgatory :bye",
                 ":op!op@host KICK #FBI_watchlist alice :out",
             ],
         );
         assert_eq!(session.presence.count(Room::Purgatory), 1);
         assert_eq!(session.presence.count(Room::Watchlist), 0);
 
-        feed(&mut session, &[":alice!~a@fish-1.chat QUIT :Ping timeout"]);
+        feed(&mut session, &[":alice!~a@h QUIT :Ping timeout"]);
         assert_eq!(session.presence.count(Room::Purgatory), 0);
     }
 
     #[test]
-    fn reads_accounts_from_extended_joins_and_account_changes() {
-        let config = Config::example();
+    fn follows_lurkers_nick_changes() {
+        let mut settings = Settings::example();
         let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker");
-        feed(&mut session, &[":alice!~a@h JOIN #purgatory alice :Alice"]);
-        let alice = session.presence.user_in(Room::Purgatory, "alice").unwrap();
-        assert_eq!(db.user(alice).1.as_deref(), Some("alice"));
-
-        feed(&mut session, &[":alice!~a@h ACCOUNT *"]);
-        assert_eq!(db.user(alice).1, None);
-
-        feed(&mut session, &[":bob!~b@h JOIN #purgatory * :Bob"]);
-        let bob = session.presence.user_in(Room::Purgatory, "bob").unwrap();
-        assert_eq!(db.user(bob).1, None);
-    }
-
-    #[test]
-    fn follows_nick_and_host_changes() {
-        let config = Config::example();
-        let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker");
-        feed(&mut session, &[":alice!~a@old JOIN #purgatory"]);
-        let alice = session.presence.user_in(Room::Purgatory, "alice").unwrap();
+        db.mark("alice", Room::Purgatory, false, "rachel", 0)
+            .unwrap();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
 
         feed(
             &mut session,
-            &[":alice!~a@old NICK alice_", ":alice_!~a@old CHGHOST ~a new"],
+            &[":alice!~a@h JOIN #purgatory", ":alice!~a@h NICK alice_"],
         );
-        assert_eq!(
-            session.presence.user_in(Room::Purgatory, "alice_"),
-            Some(alice)
-        );
-        assert_eq!(
-            db.find_user(&Key::new("alice_", "~a", "new")).unwrap(),
-            Some(alice)
-        );
+        assert!(session.presence.contains(Room::Purgatory, "alice_"));
+        assert_eq!(db.lurker("alice_").unwrap().unwrap().nick, "alice_");
+        assert_eq!(db.lurker("alice").unwrap(), None);
     }
 
     #[test]
-    fn does_not_track_itself_or_its_old_connection() {
-        let config = Config::example();
+    fn answers_admins() {
+        let mut settings = Settings::example();
         let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker_");
-        feed(
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        feed(&mut session, &[":alice!~a@h JOIN #purgatory"]);
+
+        let sent = feed(
+            &mut session,
+            &[":rachel!~r@home.example.net PRIVMSG lurker :trusted alice"],
+        );
+        assert_eq!(sent, [reply("alice is marked trusted (#purgatory).")]);
+        assert_eq!(here_since(&db, "alice"), Some(1000));
+        assert_eq!(db.lurker("alice").unwrap().unwrap().marked_by, "rachel");
+    }
+
+    #[test]
+    fn reloads_the_settings_for_admins() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        let sent = feed(
+            &mut session,
+            &[":rachel!~r@home.example.net PRIVMSG lurker :reload"],
+        );
+        let [Command::PRIVMSG(to, text)] = sent.as_slice() else {
+            panic!("expected one reply, got {sent:?}");
+        };
+        assert_eq!(to, "rachel");
+        assert!(text.ends_with("again: 1 admin"), "{text}");
+    }
+
+    #[test]
+    fn ignores_everyone_else() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        let sent = feed(
             &mut session,
             &[
-                ":irc.example.net 352 lurker_ #purgatory lurker host irc.example.net lurker_ H :0 lurker",
-                ":irc.example.net 352 lurker_ #purgatory lurker old irc.example.net lurker H :0 lurker",
+                ":rachel!~r@elsewhere.net PRIVMSG lurker :trusted alice",
+                ":mallory!~m@home.example.net PRIVMSG lurker :trusted alice",
+                ":rachel!~r@home.example.net PRIVMSG #purgatory :trusted alice",
+                ":rachel!~r@home.example.net PRIVMSG lurker :\u{1}VERSION\u{1}",
             ],
         );
-        assert_eq!(session.presence.count(Room::Purgatory), 0);
-        assert_eq!(db.user_count(), 0);
+        assert!(sent.is_empty());
+        assert_eq!(db.lurker("alice").unwrap(), None);
     }
 
     #[test]
-    fn rejoins_and_relists_after_a_kick() {
-        let config = Config::example();
+    fn rejoins_after_a_kick_or_part() {
+        let mut settings = Settings::example();
         let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker");
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
         feed(&mut session, &[":alice!~a@h JOIN #purgatory"]);
 
         feed(&mut session, &[":op!op@host KICK #purgatory lurker :out"]);
         assert_eq!(session.presence.count(Room::Purgatory), 0);
         assert_eq!(session.rejoin(), [join("#purgatory")]);
 
-        let sent = feed(&mut session, &[":lurker!lurker@host JOIN #purgatory"]);
-        assert_eq!(sent, [who("#purgatory")]);
-        assert!(session.rejoin().is_empty());
-    }
-
-    #[test]
-    fn rejoins_after_parting() {
-        let config = Config::example();
-        let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker");
         feed(&mut session, &[":lurker!lurker@host PART #FBI_watchlist"]);
-        assert_eq!(session.rejoin(), [join("#FBI_watchlist")]);
+        assert_eq!(
+            session.rejoin(),
+            [join("#purgatory"), join("#FBI_watchlist")]
+        );
     }
 
     #[test]
     fn follows_its_own_nick_changes() {
-        let config = Config::example();
+        let mut settings = Settings::example();
         let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker_");
+        let mut session = in_both_rooms(&mut settings, &db, "lurker_");
 
         let sent = feed(&mut session, &[":lurker_!lurker@host NICK lurker"]);
         assert!(sent.is_empty());
@@ -712,9 +724,9 @@ mod tests {
 
     #[test]
     fn takes_its_nick_back_when_it_is_freed() {
-        let config = Config::example();
+        let mut settings = Settings::example();
         let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker_");
+        let mut session = in_both_rooms(&mut settings, &db, "lurker_");
 
         let sent = feed(
             &mut session,
@@ -728,21 +740,10 @@ mod tests {
 
     #[test]
     fn keeps_its_nick_when_it_already_has_it() {
-        let config = Config::example();
+        let mut settings = Settings::example();
         let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker");
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
         let sent = feed(&mut session, &[":alice!alice@host QUIT :bye"]);
         assert!(sent.is_empty());
-    }
-
-    #[test]
-    fn closing_records_when_everyone_was_last_seen() {
-        let config = Config::example();
-        let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&config, &db, "lurker");
-        feed(&mut session, &[":alice!~a@h JOIN #purgatory"]);
-        session.close(2000);
-        assert_eq!(session.presence.count(Room::Purgatory), 0);
-        assert_eq!(session.rejoin().len(), 2);
     }
 }

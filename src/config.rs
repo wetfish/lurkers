@@ -16,11 +16,13 @@ pub struct Config {
     pub rooms: Rooms,
     #[serde(default)]
     pub database: Database,
+    #[serde(default)]
+    pub admins: Vec<Admin>,
 }
 
 /// How to reach the IRC server and who lurker is there. lurker always
 /// connects over TLS.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Irc {
     pub server: String,
@@ -33,7 +35,7 @@ pub struct Irc {
 }
 
 /// The two rooms lurker keeps watch over.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rooms {
     pub purgatory: String,
@@ -41,18 +43,28 @@ pub struct Rooms {
 }
 
 /// Which of the two rooms. The database stores this rather than the
-/// channel name, so renaming a room in the settings keeps its users.
+/// channel name, so renaming a room in the settings keeps its lurkers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Room {
     Purgatory,
     Watchlist,
 }
 
-/// Where lurker keeps what it knows about the users in its rooms.
-#[derive(Debug, Clone, Deserialize)]
+/// Where lurker keeps the lurkers admins have marked.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Database {
     pub path: PathBuf,
+}
+
+/// Someone who may give lurker commands.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Admin {
+    pub nick: String,
+    /// The hosts they connect from. `*` matches any characters and `?` any
+    /// one character.
+    pub hosts: Vec<String>,
 }
 
 fn default_port() -> u16 {
@@ -89,6 +101,11 @@ impl Room {
             Room::Purgatory => "purgatory",
             Room::Watchlist => "watchlist",
         }
+    }
+
+    /// The room a name from the database stands for.
+    pub fn parse(name: &str) -> Option<Room> {
+        Room::ALL.into_iter().find(|room| room.as_str() == name)
     }
 }
 
@@ -127,17 +144,18 @@ impl Rooms {
 }
 
 impl Config {
-    /// Reads and checks the settings file.
-    pub fn load(path: &Path) -> Result<Config, String> {
-        let text =
-            fs::read_to_string(path).map_err(|err| format!("reading {}: {err}", path.display()))?;
-        Config::parse(&text).map_err(|err| format!("{}: {err}", path.display()))
-    }
-
     /// The settings in `lurker.example.toml`, for tests.
     #[cfg(test)]
     pub fn example() -> Config {
         Config::parse(include_str!("../lurker.example.toml")).unwrap()
+    }
+
+    /// The admin with this nick connecting from this host, if there is one.
+    pub fn admin(&self, nick: &str, host: &str) -> Option<&Admin> {
+        self.admins.iter().find(|admin| {
+            casemap::eq(&admin.nick, nick)
+                && admin.hosts.iter().any(|pattern| wildcard(pattern, host))
+        })
     }
 
     fn parse(text: &str) -> Result<Config, String> {
@@ -182,6 +200,29 @@ impl Config {
             return Err("database.path must not be empty".to_owned());
         }
 
+        for admin in &self.admins {
+            check_name("admins.nick", &admin.nick)?;
+            let nick = &admin.nick;
+            if admin.hosts.is_empty() {
+                return Err(format!("admin {nick} needs at least one host in hosts"));
+            }
+            for host in &admin.hosts {
+                if host.is_empty() || host.contains(|c: char| c.is_whitespace() || "!@".contains(c))
+                {
+                    return Err(format!(
+                        "admin {nick} has the host {host:?}, which must be a host name or \
+                         pattern without spaces, ! or @"
+                    ));
+                }
+                if host.chars().all(|c| "*?.".contains(c)) {
+                    return Err(format!(
+                        "admin {nick} has the host {host:?}, which would let anyone using \
+                         the nick give lurker commands"
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -209,17 +250,135 @@ fn check_room(setting: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a host matches a pattern, ignoring case, where `*` matches any
+/// characters and `?` any one character.
+fn wildcard(pattern: &str, host: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let host: Vec<char> = host.to_ascii_lowercase().chars().collect();
+
+    let (mut p, mut h) = (0, 0);
+    // Where the last `*` was, and the host position it is matching up to
+    let mut star: Option<(usize, usize)> = None;
+
+    while h < host.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == host[h]) {
+            p += 1;
+            h += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, h));
+            p += 1;
+        } else if let Some((star_p, star_h)) = star {
+            // Let the last `*` match one more character and try again
+            p = star_p + 1;
+            h = star_h + 1;
+            star = Some((star_p, star_h + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
+}
+
+/// The settings file and the settings lurker is running with. While lurker
+/// runs, it reads the file again when it changes and takes the new admins;
+/// other settings take effect when lurker restarts.
+pub struct Settings {
+    path: PathBuf,
+    /// The file as last read, to notice when it changes. None when it could
+    /// not be read.
+    text: Option<String>,
+    pub config: Config,
+}
+
+impl Settings {
+    /// Reads and checks the settings file.
+    pub fn load(path: &Path) -> Result<Settings, String> {
+        let text = read(path)?;
+        let config = Config::parse(&text).map_err(|err| format!("{}: {err}", path.display()))?;
+        Ok(Settings {
+            path: path.to_owned(),
+            text: Some(text),
+            config,
+        })
+    }
+
+    /// Settings from `lurker.example.toml`, for tests.
+    #[cfg(test)]
+    pub fn example() -> Settings {
+        Settings {
+            path: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/lurker.example.toml")),
+            text: None,
+            config: Config::example(),
+        }
+    }
+
+    /// Reads the file again if it changed since it was last read, or always
+    /// when `force` is set. Returns what happened, for the log or the admin
+    /// who asked, or None when nothing changed.
+    pub fn reload(&mut self, force: bool) -> Option<Result<String, String>> {
+        let text = match read(&self.path) {
+            Ok(text) => text,
+            Err(err) => {
+                // Say so once, rather than every time lurker checks
+                let was_readable = self.text.take().is_some();
+                return (force || was_readable).then_some(Err(err));
+            }
+        };
+
+        if !force && self.text.as_deref() == Some(text.as_str()) {
+            return None;
+        }
+        let result = self.apply(&text);
+        self.text = Some(text);
+        Some(result)
+    }
+
+    /// Takes the admins from the file's text, keeping the current settings
+    /// if anything in it is wrong.
+    fn apply(&mut self, text: &str) -> Result<String, String> {
+        let path = self.path.display();
+        let new = Config::parse(text)
+            .map_err(|err| format!("{path}: {err}. lurker is keeping its previous settings"))?;
+
+        let count = new.admins.len();
+        let mut summary = format!(
+            "Read {path} again: {count} admin{}",
+            if count == 1 { "" } else { "s" }
+        );
+        if new.irc != self.config.irc
+            || new.rooms != self.config.rooms
+            || new.database != self.config.database
+        {
+            summary.push_str(
+                ". Changes to [irc], [rooms] and [database] take effect when lurker restarts",
+            );
+        }
+
+        self.config.admins = new.admins;
+        Ok(summary)
+    }
+}
+
+fn read(path: &Path) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|err| format!("reading {}: {err}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const MINIMAL: &str = "[irc]\nserver = \"irc.example.net\"\n";
 
+    fn with_admin(hosts: &str) -> String {
+        format!("{MINIMAL}[[admins]]\nnick = \"rachel\"\nhosts = {hosts}\n")
+    }
+
     #[test]
     fn example_file_is_valid() {
         let config = Config::example();
         assert_eq!(config.irc.nick, "lurker");
         assert_eq!(config.rooms.all(), ["#purgatory", "#FBI_watchlist"]);
+        assert_eq!(config.admins.len(), 1);
     }
 
     #[test]
@@ -231,6 +390,7 @@ mod tests {
         assert_eq!(config.irc.realname(), "lurker");
         assert_eq!(config.rooms.all(), ["#purgatory", "#FBI_watchlist"]);
         assert_eq!(config.database.path, PathBuf::from("lurker.sqlite"));
+        assert!(config.admins.is_empty());
     }
 
     #[test]
@@ -283,5 +443,75 @@ mod tests {
             format!("{MINIMAL}[rooms]\npurgatory = \"#Lurkers\"\nwatchlist = \"#lurkers\"\n");
         let err = Config::parse(&text).unwrap_err();
         assert!(err.contains("different"), "{err}");
+    }
+
+    #[test]
+    fn rejects_admins_anyone_could_be() {
+        for hosts in ["[]", "[\"*\"]", "[\"*.*\"]", "[\"\"]", "[\"user@host\"]"] {
+            assert!(
+                Config::parse(&with_admin(hosts)).is_err(),
+                "accepted hosts {hosts}"
+            );
+        }
+    }
+
+    #[test]
+    fn recognizes_admins_by_nick_and_host() {
+        let config = Config::parse(&with_admin("[\"*.wetfish.net\", \"Fish-??.chat\"]")).unwrap();
+        assert!(config.admin("Rachel", "home.wetfish.net").is_some());
+        assert!(config.admin("rachel", "FISH-12.chat").is_some());
+        assert!(config.admin("rachel", "fish-123.chat").is_none());
+        assert!(config.admin("rachel", "wetfish.net.example.com").is_none());
+        assert!(config.admin("bob", "home.wetfish.net").is_none());
+    }
+
+    #[test]
+    fn matches_wildcards() {
+        assert!(wildcard("*", ""));
+        assert!(wildcard("a*b*c", "aXXbYYc"));
+        assert!(wildcard("a*b", "abab"));
+        assert!(!wildcard("a*b", "abac"));
+        assert!(wildcard("??", "ab"));
+        assert!(!wildcard("??", "abc"));
+        assert!(wildcard("host", "HOST"));
+    }
+
+    #[test]
+    fn reload_takes_new_admins() {
+        let mut settings = Settings::example();
+        let summary = settings.apply(&with_admin("[\"new.host\"]")).unwrap();
+        assert!(
+            summary.ends_with("lurker.example.toml again: 1 admin"),
+            "{summary}"
+        );
+        assert_eq!(settings.config.admins[0].hosts, ["new.host"]);
+    }
+
+    #[test]
+    fn reload_says_other_changes_wait_for_a_restart() {
+        let mut settings = Settings::example();
+        let text = "[irc]\nserver = \"irc.example.net\"\nnick = \"lurker2\"\n";
+        let summary = settings.apply(text).unwrap();
+        assert!(summary.contains("0 admins"), "{summary}");
+        assert!(summary.contains("restarts"), "{summary}");
+        assert_eq!(settings.config.irc.nick, "lurker");
+        assert!(settings.config.admins.is_empty());
+    }
+
+    #[test]
+    fn reload_keeps_the_settings_when_the_file_is_wrong() {
+        let mut settings = Settings::example();
+        let err = settings.apply("[irc]\n").unwrap_err();
+        assert!(err.contains("keeping its previous settings"), "{err}");
+        assert_eq!(settings.config.admins.len(), 1);
+    }
+
+    #[test]
+    fn reload_without_other_changes_says_nothing_about_restarting() {
+        let mut settings = Settings::example();
+        let summary = settings
+            .apply(include_str!("../lurker.example.toml"))
+            .unwrap();
+        assert!(!summary.contains("restarts"), "{summary}");
     }
 }

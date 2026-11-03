@@ -1,6 +1,8 @@
+mod admin;
 mod casemap;
 mod config;
 mod connection;
+mod dates;
 mod db;
 mod presence;
 mod shutdown;
@@ -8,7 +10,7 @@ mod shutdown;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::config::Config;
+use crate::config::Settings;
 use crate::db::Db;
 use crate::shutdown::Shutdown;
 
@@ -45,15 +47,15 @@ async fn main() -> ExitCode {
         }
     };
 
-    let config = match Config::load(&path) {
-        Ok(config) => config,
+    let mut settings = match Settings::load(&path) {
+        Ok(settings) => settings,
         Err(err) => {
             eprintln!("error: {err}");
             return ExitCode::FAILURE;
         }
     };
 
-    let db = match Db::open(&config.database.path) {
+    let db = match Db::open(&settings.config.database.path) {
         Ok(db) => db,
         Err(err) => {
             eprintln!("error: {err}");
@@ -69,7 +71,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    connection::run(&config, &db, &mut shutdown).await;
+    connection::run(&mut settings, &db, &mut shutdown).await;
     ExitCode::SUCCESS
 }
 

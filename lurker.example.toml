@@ -23,6 +23,15 @@ purgatory = "#purgatory"
 watchlist = "#FBI_watchlist"
 
 [database]
-# Where lurker keeps what it knows about the users in its rooms. It is
-# created when missing.
+# Where lurker keeps the lurkers admins have marked. It is created when
+# missing.
 path = "lurker.sqlite"
+
+# The admins, who mark lurkers and give lurker other commands in private
+# messages. A message only counts as an admin's when it comes from their nick
+# and one of their hosts, where * matches any characters and ? any one
+# character. lurker reads this file again when it changes, so admins can be
+# added and removed while it runs. Repeat [[admins]] for each admin.
+[[admins]]
+nick = "rachel"
+hosts = ["*.example.net"]
