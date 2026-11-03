@@ -2,3 +2,6 @@
 
 # Local settings, copied from lurker.example.toml
 /lurker.toml
+
+# The default database, and SQLite's temporary files next to it
+/lurker.sqlite*

@@ -1,12 +1,15 @@
 mod casemap;
 mod config;
 mod connection;
+mod db;
+mod presence;
 mod shutdown;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::config::Config;
+use crate::db::Db;
 use crate::shutdown::Shutdown;
 
 /// The settings file read when none is given. `.gitignore` excludes it.
@@ -50,6 +53,14 @@ async fn main() -> ExitCode {
         }
     };
 
+    let db = match Db::open(&config.database.path) {
+        Ok(db) => db,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let mut shutdown = match Shutdown::new() {
         Ok(shutdown) => shutdown,
         Err(err) => {
@@ -58,7 +69,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    connection::run(&config, &mut shutdown).await;
+    connection::run(&config, &db, &mut shutdown).await;
     ExitCode::SUCCESS
 }
 

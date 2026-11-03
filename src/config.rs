@@ -2,7 +2,7 @@
 //! `lurker.example.toml`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -14,6 +14,8 @@ pub struct Config {
     pub irc: Irc,
     #[serde(default)]
     pub rooms: Rooms,
+    #[serde(default)]
+    pub database: Database,
 }
 
 /// How to reach the IRC server and who lurker is there. lurker always
@@ -38,6 +40,21 @@ pub struct Rooms {
     pub watchlist: String,
 }
 
+/// Which of the two rooms. The database stores this rather than the
+/// channel name, so renaming a room in the settings keeps its users.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Room {
+    Purgatory,
+    Watchlist,
+}
+
+/// Where lurker keeps what it knows about the users in its rooms.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Database {
+    pub path: PathBuf,
+}
+
 fn default_port() -> u16 {
     6697
 }
@@ -51,6 +68,26 @@ impl Default for Rooms {
         Rooms {
             purgatory: "#purgatory".to_owned(),
             watchlist: "#FBI_watchlist".to_owned(),
+        }
+    }
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Database {
+            path: PathBuf::from("lurker.sqlite"),
+        }
+    }
+}
+
+impl Room {
+    pub const ALL: [Room; 2] = [Room::Purgatory, Room::Watchlist];
+
+    /// The name the database stores for the room.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Room::Purgatory => "purgatory",
+            Room::Watchlist => "watchlist",
         }
     }
 }
@@ -70,7 +107,22 @@ impl Irc {
 impl Rooms {
     /// Both rooms, #purgatory first.
     pub fn all(&self) -> [&str; 2] {
-        [self.purgatory.as_str(), self.watchlist.as_str()]
+        Room::ALL.map(|room| self.channel(room))
+    }
+
+    /// The channel name of a room.
+    pub fn channel(&self, room: Room) -> &str {
+        match room {
+            Room::Purgatory => &self.purgatory,
+            Room::Watchlist => &self.watchlist,
+        }
+    }
+
+    /// Which room a channel is, if it is one of them.
+    pub fn find(&self, channel: &str) -> Option<Room> {
+        Room::ALL
+            .into_iter()
+            .find(|&room| casemap::eq(self.channel(room), channel))
     }
 }
 
@@ -126,6 +178,10 @@ impl Config {
             return Err("rooms.purgatory and rooms.watchlist must be different rooms".to_owned());
         }
 
+        if self.database.path.as_os_str().is_empty() {
+            return Err("database.path must not be empty".to_owned());
+        }
+
         Ok(())
     }
 }
@@ -174,6 +230,15 @@ mod tests {
         assert_eq!(config.irc.username(), "lurker");
         assert_eq!(config.irc.realname(), "lurker");
         assert_eq!(config.rooms.all(), ["#purgatory", "#FBI_watchlist"]);
+        assert_eq!(config.database.path, PathBuf::from("lurker.sqlite"));
+    }
+
+    #[test]
+    fn finds_rooms_regardless_of_case() {
+        let config = Config::example();
+        assert_eq!(config.rooms.find("#PURGATORY"), Some(Room::Purgatory));
+        assert_eq!(config.rooms.find("#fbi_watchlist"), Some(Room::Watchlist));
+        assert_eq!(config.rooms.find("#wetfish"), None);
     }
 
     #[test]

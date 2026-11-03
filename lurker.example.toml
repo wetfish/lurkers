@@ -21,3 +21,8 @@ nick = "lurker"
 # without disturbing the real rooms.
 purgatory = "#purgatory"
 watchlist = "#FBI_watchlist"
+
+[database]
+# Where lurker keeps what it knows about the users in its rooms. It is
+# created when missing.
+path = "lurker.sqlite"
