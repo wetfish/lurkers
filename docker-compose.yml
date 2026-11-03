@@ -1,0 +1,26 @@
+# lurker on a Wetfish server; see docs/deploying.md. Deploys add the shared
+# web network, so the server's Caddy reaches the status page at lurker:8080.
+services:
+  lurker:
+    build: .
+    restart: unless-stopped
+    volumes:
+      # The database
+      - data:/data
+      # lurker.toml, which deploys copy here from the server's
+      # config/lurker/settings/. The folder rather than the file, so lurker
+      # sees a changed file and reads it again without restarting.
+      - ./settings:/settings:ro
+    healthcheck:
+      # Healthy while lurker is connected to IRC. http.listen in lurker.toml
+      # must be 0.0.0.0:8080 for this to reach it.
+      test: ["CMD", "lurker", "--health", "127.0.0.1:8080"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      start_interval: 2s
+    # Time for lurker to send QUIT before Docker stops it for good
+    stop_grace_period: 15s
+
+volumes:
+  data:

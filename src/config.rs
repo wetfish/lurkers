@@ -2,6 +2,7 @@
 //! `lurker.example.toml`.
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -16,6 +17,8 @@ pub struct Config {
     pub rooms: Rooms,
     #[serde(default)]
     pub database: Database,
+    #[serde(default)]
+    pub http: Http,
     #[serde(default)]
     pub admins: Vec<Admin>,
 }
@@ -55,6 +58,15 @@ pub enum Room {
 #[serde(deny_unknown_fields)]
 pub struct Database {
     pub path: PathBuf,
+}
+
+/// The status page, which says only whether lurker is connected to IRC.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Http {
+    /// The address and port to serve it on, such as `0.0.0.0:8080`. No page
+    /// is served without one.
+    pub listen: Option<String>,
 }
 
 /// Someone who may give lurker commands.
@@ -198,6 +210,15 @@ impl Config {
 
         if self.database.path.as_os_str().is_empty() {
             return Err("database.path must not be empty".to_owned());
+        }
+
+        if let Some(listen) = &self.http.listen
+            && listen.parse::<SocketAddr>().is_err()
+        {
+            return Err(format!(
+                "http.listen is {listen:?}, which must be an address and port, such as \
+                 0.0.0.0:8080"
+            ));
         }
 
         for admin in &self.admins {
@@ -348,9 +369,11 @@ impl Settings {
         if new.irc != self.config.irc
             || new.rooms != self.config.rooms
             || new.database != self.config.database
+            || new.http != self.config.http
         {
             summary.push_str(
-                ". Changes to [irc], [rooms] and [database] take effect when lurker restarts",
+                ". Changes to [irc], [rooms], [database] and [http] take effect when lurker \
+                 restarts",
             );
         }
 
@@ -391,6 +414,20 @@ mod tests {
         assert_eq!(config.rooms.all(), ["#purgatory", "#FBI_watchlist"]);
         assert_eq!(config.database.path, PathBuf::from("lurker.sqlite"));
         assert!(config.admins.is_empty());
+        assert_eq!(config.http.listen, None);
+    }
+
+    #[test]
+    fn checks_the_status_page_address() {
+        let text = format!("{MINIMAL}[http]\nlisten = \"0.0.0.0:8080\"\n");
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.http.listen.as_deref(), Some("0.0.0.0:8080"));
+
+        for listen in ["8080", "localhost:8080", "0.0.0.0"] {
+            let text = format!("{MINIMAL}[http]\nlisten = \"{listen}\"\n");
+            let err = Config::parse(&text).unwrap_err();
+            assert!(err.contains("http.listen"), "{err}");
+        }
     }
 
     #[test]

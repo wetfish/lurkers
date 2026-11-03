@@ -13,5 +13,5 @@ futures-util = { version = "0.3.34", default-features = false }
 irc = { version = "1.1.0", default-features = false, features = ["ctcp", "tls-rust"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.54.1", features = ["macros", "rt", "signal", "time"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt", "signal", "time"] }
 toml = "1.1.8"

@@ -5,3 +5,7 @@
 
 # The default database, and SQLite's temporary files next to it
 /lurker.sqlite*
+
+# Settings for trying lurker in Docker, and on a Wetfish server the settings
+# a deploy copies in from config/lurker/settings/
+/settings/

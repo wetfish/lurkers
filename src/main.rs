@@ -4,6 +4,7 @@ mod config;
 mod connection;
 mod dates;
 mod db;
+mod http;
 mod messages;
 mod presence;
 mod rng;
@@ -16,6 +17,7 @@ use std::process::ExitCode;
 
 use crate::config::Settings;
 use crate::db::Db;
+use crate::http::Status;
 use crate::messages::Messages;
 use crate::shutdown::Shutdown;
 
@@ -23,13 +25,18 @@ use crate::shutdown::Shutdown;
 const DEFAULT_CONFIG: &str = "lurker.toml";
 
 const USAGE: &str = "usage: lurker [CONFIG]
+       lurker --health ADDRESS
 
 Connects to IRC and keeps watch over the rooms in CONFIG, a TOML file
-laid out like lurker.example.toml. CONFIG defaults to lurker.toml.";
+laid out like lurker.example.toml. CONFIG defaults to lurker.toml.
+
+--health asks the status page at ADDRESS, such as 127.0.0.1:8080, whether
+lurker is connected to IRC, and exits with 0 when it is.";
 
 /// What the command line asks for.
 enum Args {
     Run(PathBuf),
+    Health(String),
     Help,
     Version,
 }
@@ -38,6 +45,15 @@ enum Args {
 async fn main() -> ExitCode {
     let path = match parse_args() {
         Ok(Args::Run(path)) => path,
+        Ok(Args::Health(address)) => {
+            return match http::check(&address) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Ok(Args::Help) => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -76,6 +92,17 @@ async fn main() -> ExitCode {
         }
     };
 
+    let listener = match &settings.config.http.listen {
+        Some(address) => match http::bind(address).await {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     let mut shutdown = match Shutdown::new() {
         Ok(shutdown) => shutdown,
         Err(err) => {
@@ -84,7 +111,19 @@ async fn main() -> ExitCode {
         }
     };
 
-    connection::run(&mut settings, &db, &messages, &mut shutdown).await;
+    let status = Status::default();
+    let page = async {
+        match listener {
+            Some(listener) => http::serve(listener, status.clone()).await,
+            None => std::future::pending().await,
+        }
+    };
+
+    // The status page runs until lurker stops
+    tokio::select! {
+        () = connection::run(&mut settings, &db, &messages, &status, &mut shutdown) => {}
+        () = page => {}
+    }
     ExitCode::SUCCESS
 }
 
@@ -94,6 +133,17 @@ fn parse_args() -> Result<Args, String> {
     let Some(first) = args.next() else {
         return Ok(Args::Run(PathBuf::from(DEFAULT_CONFIG)));
     };
+
+    if first == "--health" {
+        let address = args
+            .next()
+            .ok_or("--health needs the status page's address, such as 127.0.0.1:8080")?;
+        if let Some(extra) = args.next() {
+            return Err(format!("unexpected argument '{}'", extra.to_string_lossy()));
+        }
+        return Ok(Args::Health(address.to_string_lossy().into_owned()));
+    }
+
     if let Some(extra) = args.next() {
         return Err(format!("unexpected argument '{}'", extra.to_string_lossy()));
     }

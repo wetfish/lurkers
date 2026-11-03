@@ -21,6 +21,7 @@ use crate::admin;
 use crate::casemap;
 use crate::config::{Room, Settings};
 use crate::db::{Db, Lurker, NickChange};
+use crate::http::Status;
 use crate::messages::{self, Facts, Kind, Messages};
 use crate::presence::Presence;
 use crate::rng::Rng;
@@ -68,13 +69,21 @@ const STABLE_CONNECTION: Duration = Duration::from_secs(300);
 
 /// Stays connected, reconnecting whenever the connection is lost, until
 /// lurker is stopped.
-pub async fn run(settings: &mut Settings, db: &Db, messages: &Messages, shutdown: &mut Shutdown) {
+pub async fn run(
+    settings: &mut Settings,
+    db: &Db,
+    messages: &Messages,
+    status: &Status,
+    shutdown: &mut Shutdown,
+) {
     let mut delay = FIRST_RETRY_DELAY;
 
     loop {
         let started = Instant::now();
 
-        match connect(settings, db, messages, shutdown).await {
+        let result = connect(settings, db, messages, status, shutdown).await;
+        status.set_connected(false);
+        match result {
             Ok(()) => return,
             Err(err) => eprintln!("error: {err}"),
         }
@@ -99,6 +108,7 @@ async fn connect(
     settings: &mut Settings,
     db: &Db,
     messages: &Messages,
+    status: &Status,
     shutdown: &mut Shutdown,
 ) -> Result<(), String> {
     let server = settings.config.irc.server.clone();
@@ -128,7 +138,7 @@ async fn connect(
     client.identify().map_err(|err| describe(&err))?;
     let mut stream = client.stream().map_err(|err| describe(&err))?;
     let mut session = Session::new(settings, db, messages);
-    serve(&client, &mut stream, &mut session, shutdown).await
+    serve(&client, &mut stream, &mut session, status, shutdown).await
 }
 
 /// Handles messages, rejoins channels, rereads the settings and deals with
@@ -137,6 +147,7 @@ async fn serve(
     client: &Client,
     stream: &mut ClientStream,
     session: &mut Session<'_>,
+    status: &Status,
     shutdown: &mut Shutdown,
 ) -> Result<(), String> {
     let mut rejoin = time::interval(REJOIN_INTERVAL);
@@ -173,6 +184,8 @@ async fn serve(
         for command in commands {
             client.send(command).map_err(|err| describe(&err))?;
         }
+        // Connected once the server has accepted the connection
+        status.set_connected(session.registered);
     }
 }
 

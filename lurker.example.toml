@@ -27,11 +27,19 @@ watchlist = "#FBI_watchlist"
 # missing.
 path = "lurker.sqlite"
 
-# The admins, who mark lurkers and give lurker other commands in private
-# messages. A message only counts as an admin's when it comes from their nick
-# and one of their hosts, where * matches any characters and ? any one
-# character. lurker reads this file again when it changes, so admins can be
-# added and removed while it runs. Repeat [[admins]] for each admin.
+[http]
+# The status page, which only says whether lurker is connected to IRC, and
+# /up, which answers 200 while lurker is connected and 503 while it isn't.
+# Nothing is served unless this is set. On a Wetfish server it must be
+# 0.0.0.0:8080; see docs/deploying.md.
+#listen = "127.0.0.1:8080"
+
+# The admins, who mark lurkers and give lurker other commands, in private
+# messages or in channels after its nick. A message only counts as an
+# admin's when it comes from their nick and one of their hosts, where *
+# matches any characters and ? any one character. lurker reads this file
+# again when it changes, so admins can be added and removed while it runs.
+# Repeat [[admins]] for each admin.
 [[admins]]
 nick = "rachel"
 hosts = ["*.example.net"]

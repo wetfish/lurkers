@@ -1,0 +1,7 @@
+# For trying lurker in Docker on your own computer, with your settings in
+# settings/lurker.toml: docker compose up --build. Deploys leave this file
+# out. The status page is then at http://localhost:8080/.
+services:
+  lurker:
+    ports:
+      - "127.0.0.1:8080:8080"

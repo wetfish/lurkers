@@ -26,7 +26,9 @@ record what they know about them with commands, and lurker welcomes each
 lurker to their room, makes a fuss when one speaks, and pings each one about
 once a week. Admins can also invite lurker to other channels, where, given +h
 or +o, it warns marked lurkers and kicks them to their room after their grace
-period. Deployment comes next.
+period. It runs on a Wetfish server at `lurkers.wetfish.net`; see
+[Deploying](docs/deploying.md). Operator powers, so lurker can op itself,
+kick lurkers from every channel and sajoin them into their room, come next.
 
 ## Requirements
 
@@ -65,6 +67,7 @@ cp lurker.example.toml lurker.toml
 | `rooms.purgatory` | `#purgatory` | The room for people who used to be active |
 | `rooms.watchlist` | `#FBI_watchlist` | The room for people nobody knows |
 | `database.path` | `lurker.sqlite` | The [database](#database), created when missing. A relative path is relative to the folder lurker runs in. |
+| `http.listen` | none | Where to serve the [status page](#status-page), such as `0.0.0.0:8080`. Without it, there is no page. |
 | `admins` | none | The [admins](#admins), each in its own `[[admins]]` section with a `nick` and `hosts` |
 
 Settings lurker doesn't know are an error, so typos don't go unnoticed.
@@ -92,6 +95,17 @@ update".
 To try lurker without disturbing the real rooms, give it another nick and
 other rooms in `lurker.toml`, such as `#purgatory-test` and
 `#watchlist-test`.
+
+To run it in Docker, or on a Wetfish server, see
+[Deploying](docs/deploying.md).
+
+### Status page
+
+With `http.listen` set, lurker serves a page that only says whether it is
+connected to IRC, and shows nothing about anyone in its rooms or channels.
+`/up` answers 200 while lurker is connected and 503 while it isn't, for
+health checks. `lurker --health 127.0.0.1:8080` asks it, and exits with 0
+when lurker is connected; the container's health check runs it.
 
 ## Staying Connected
 

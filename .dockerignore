@@ -1,0 +1,9 @@
+# Only the source goes into the image; settings and the database reach the
+# container at run time
+.git
+target
+settings
+lurker.toml
+lurker.sqlite*
+.env
+*.env
