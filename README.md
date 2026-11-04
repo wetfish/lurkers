@@ -158,7 +158,6 @@ place, so in a channel everyone there sees the answer.
 | --- | --- |
 | `trusted <nick> <fields>` | Marks or updates a lurker for #purgatory |
 | `untrusted <nick> <fields>` | Marks or updates a lurker for #FBI_watchlist |
-| `unchannel <nick> <#channel>` | Removes a channel from a lurker |
 | `info <nick>` | Shows everything recorded about a lurker, ending with it all as one command |
 | `list` | Lists the lurkers for each room, marking those in it now with `(here)` |
 | `forget <nick>` | Deletes a lurker |
@@ -177,14 +176,14 @@ order:
 | Field | Means |
 | --- | --- |
 | `grace=<time>` | How long after a [warning](#warnings-and-kicks) lurker kicks them from every channel and sajoins them into their room: minutes, hours, days or weeks, such as `90m`, `12h`, `3d` or `2w`, or `never`. Giving it starts their warning over. |
-| `#channel=<date>` | A channel they idled in, and when they went silent there: when they last spoke, or showed up if they never did |
-| `since=<date>` | The date for every channel given without one, as in `since=180d #wetfish #music` |
-| `peak=<year>/<daily\|weekly\|monthly>` | How often a trusted lurker chatted in the year they were most active |
+| `silent=<date>` | When they went silent: when they last spoke anywhere, or showed up if they never did |
+| `activity=<daily\|weekly\|monthly>` | How often a trusted lurker chatted in the year they were most active. Given together with `year`. |
+| `year=<year>` | The year a trusted lurker was most active. Given together with `activity`. |
 
 ```text
-untrusted bob grace=3d #wetfish=180d #music=95d
-untrusted bob grace=3d since=180d #wetfish #music
-trusted alice grace=7d #wetfish=348d #dryfish=2025-11-19 peak=2022/daily
+untrusted bob grace=3d silent=180d
+trusted alice grace=7d silent=348d activity=daily year=2024
+trusted carol grace=2w silent=2025-11-19
 ```
 
 Dates are `YYYY-MM-DD`, or a number of days ago such as `180d`, which lurker
@@ -194,16 +193,16 @@ numbers can come from `wot analyze --nick`.
 Marking someone new needs `grace`, so each lurker can be given their own.
 Marking someone already marked changes only the fields given and keeps the
 rest, so `untrusted bob grace=never` only changes bob's grace period and
-`untrusted bob #irc=30d` only adds a channel. Giving a channel they already
-have changes its date. lurker checks the whole command before changing
-anything, so a mistake anywhere in it changes nothing.
+`untrusted bob silent=30d` only changes when he went silent. lurker checks
+the whole command before changing anything, so a mistake anywhere in it
+changes nothing.
 
 Marking someone already marked for the other room moves them, and their time
 in the room, their pings and their warning start again. Their grace period
-and channels stay.
+and silent date stay.
 
 `info` ends with everything recorded about a lurker as one command, such as
-`As one command: untrusted bob grace=3d #music=2026-07-30 #wetfish=2026-05-06`,
+`As one command: untrusted bob grace=3d silent=2026-05-06`,
 to copy, change and send back.
 
 ## Channels
@@ -337,8 +336,8 @@ lurker talks to lurkers in their own room only, and never to anyone else:
 The admin notice looks like this:
 
 ```text
-#purgatory: alice spoke after 41 days in the room (silent 348 days in #wetfish, #dryfish): "hello? is anyone here"
-#FBI_watchlist: bob spoke after 12 days in the room (silent 180 days in #wetfish): "uh hi"
+#purgatory: alice spoke after 41 days in the room (silent 348 days): "hello? is anyone here"
+#FBI_watchlist: bob spoke after 12 days in the room (silent 180 days): "uh hi"
 #purgatory: carol spoke after 3 days in the room (no notes recorded): "hey"
 ```
 
@@ -351,8 +350,8 @@ list before any repeats.
 
 Placeholders in braces are filled in for the lurker. A message is only used
 when everything it needs is recorded, so a lurker without notes only gets
-the messages that need none, and gets more as admins add channels and peak
-activity.
+the messages that need none, and gets more as admins add when they went
+silent and how active they were.
 
 | Placeholder | Room | Renders as |
 | --- | --- | --- |
@@ -360,15 +359,11 @@ activity.
 | `{room}` | both | The channel name of the lurker's room |
 | `{grace}` | both | Their grace period, such as `3 days` or `90 minutes` |
 | `{here}` | both | Time since they first joined their room |
-| `{channel}` | both | One of their channels, picked at random |
-| `{channels}` | both | All their channels, such as `#wetfish, #music and #dryfish` |
-| `{idle}` | #purgatory | Time since they went silent: since the most recent of their channels' dates |
-| `{channel_idle}` | #purgatory | Time since they went silent in `{channel}` |
-| `{last_spoke}` | #purgatory | The most recent of their channels' dates, such as `March 3, 2025` |
-| `{peak_year}` | #purgatory | The year they were most active |
-| `{peak_frequency}` | #purgatory | `every day`, `every week` or `every month` |
+| `{idle}` | #purgatory | Time since they went silent, from `silent=` |
+| `{last_spoke}` | #purgatory | The date they went silent, such as `March 3, 2025` |
+| `{peak_year}` | #purgatory | The year they were most active, from `year=` |
+| `{peak_frequency}` | #purgatory | `every day`, `every week` or `every month`, from `activity=` |
 | `{lurking}` | #FBI_watchlist | The same as `{idle}` |
-| `{channel_lurking}` | #FBI_watchlist | The same as `{channel_idle}` |
 | `{silent_since}` | #FBI_watchlist | The same as `{last_spoke}` |
 
 In #FBI_watchlist, times, dates and `AND` are in capitals to match the
@@ -423,7 +418,7 @@ Times are whole seconds since 1970 UTC. In `sqlite3`,
 | `nick` | Their nick, as the admin gave it or as they changed it to |
 | `nick_key` | The nick lowercased with IRC's case mapping, to look them up |
 | `room` | `purgatory` for a trusted lurker or `watchlist` for an untrusted one, rather than the channel name, so renaming a room in the settings keeps its lurkers |
-| `peak_year`, `peak_frequency` | The year they were most active, and `daily`, `weekly` or `monthly` |
+| `peak_year`, `peak_frequency` | The year they were most active, and `daily`, `weekly` or `monthly`, from `year=` and `activity=` |
 | `here_since` | When lurker first saw them in their room, or empty until then |
 | `marked_by`, `marked_at` | The admin who last marked them, and when |
 | `next_ping_at` | When lurker next pings them, set once their time in the room has started |
@@ -431,15 +426,11 @@ Times are whole seconds since 1970 UTC. In `sqlite3`,
 | `grace` | How many seconds after their warning they are kicked from every channel, or empty for never |
 | `warned_at` | When lurker warned them, or empty until it does, and again after a new grace period or a move to the other room |
 | `spoke_at` | When lurker last saw them say something, in any channel it is in. After `warned_at`, it stops the kicks. |
+| `silent_since` | `YYYY-MM-DD` from `silent=`: when they went silent, which is when they last spoke anywhere, or were first seen if they never spoke |
 
-`lurker_channels` has the channels each lurker idled in:
-
-| Column | Contents |
-| --- | --- |
-| `lurker_id` | The lurker |
-| `channel` | The channel, as the admin gave it |
-| `channel_key` | The channel lowercased with IRC's case mapping |
-| `since` | `YYYY-MM-DD`: when they went silent there, which is when they last spoke, or were first seen if they never spoke |
+Lurkers used to be recorded with a date for each channel they idled in, in a
+`lurker_channels` table. Upgrading an older database keeps the most recent of
+each lurker's channel dates as their `silent_since` and drops that table.
 
 `used_pings` has the ping messages each lurker has heard since they last heard
 every one they can, by `lurker_id` and `template`, the message's position in

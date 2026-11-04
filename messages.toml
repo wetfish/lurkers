@@ -36,13 +36,13 @@ ping = [
     "{nick}: you've been quiet for {idle:menstrual_cycles}. I'm not judging. I just miss you.",
     "{nick}: {idle:heartbeats} have gone by since you last spoke. I felt every one of them.",
     "{nick}: {idle:full_moons} have come and gone since you last spoke. I watched every one of them alone.",
-    "{nick}: {channel} hasn't been the same these last {channel_idle}. Everyone asks about you. Well, I ask about you.",
-    "{nick}: I walked past {channel} today. Your old spot is still there. It's been {channel_idle:silly}.",
-    "{nick}: remember the good old days in {channels}? I do. I think about them a lot.",
+    "{nick}: the chat hasn't been the same these last {idle}. Everyone asks about you. Well, I ask about you.",
+    "{nick}: I walked past your old spot today. It's still there. It's been {idle:silly}.",
+    "{nick}: remember the good old days? I do. I think about them a lot.",
     "{nick}: the last time you said anything was {last_spoke}. I wish I'd known it was the last time. I would have said something nice.",
     "{nick}: Wow! You used to chat {peak_frequency} in {peak_year} but now you're gone 😢",
     "{nick}: {peak_year} was a good year, wasn't it? You were around {peak_frequency}. I still think about it sometimes.",
-    "{nick}: you were in {channel} {peak_frequency} back in {peak_year}. Was it something we said? I'm sorry if it was.",
+    "{nick}: you were here {peak_frequency} back in {peak_year}. Was it something we said? I'm sorry if it was.",
     "{nick}: I'm not mad. I'm just remembering {peak_year}, when you showed up {peak_frequency}. Those were the days.",
 ]
 
@@ -101,10 +101,10 @@ ping = [
     "{nick}! YOU'VE BEEN LURKING FOR {lurking:menstrual_cycles}. THAT'S NOT A STAKEOUT, THAT'S A LIFESTYLE!",
     "{nick}! I'VE WORKED {lurking:shifts} WATCHING YOU AND I'VE GOT NOTHING! NOTHING!",
     "{nick}! {lurking:dog_years}! EVEN THE K-9 UNIT HAS GIVEN UP ON YOU!",
-    "{nick}! YOU SAT IN {channel} FOR {channel_lurking} AND DIDN'T SAY A WORD! WHAT WERE YOU DOING IN THERE?! TAKING NOTES?!",
-    "{nick}. {channels}. WE KNOW ABOUT ALL OF THEM. WE'VE GOT THE TAPES, PAL.",
-    "{nick}! NOBODY IN {channel} KNOWS WHO YOU ARE. NOBODY. {channel_lurking} IN THERE AND NOT ONE FRIEND.",
-    "{nick}! WHO SENT YOU? WHO'S PAYING YOU TO SIT IN {channel}? IS IT THE SCRAPERS? IT'S THE SCRAPERS, ISN'T IT?!",
+    "{nick}! YOU SAT IN OUR CHANNELS FOR {lurking} AND DIDN'T SAY A WORD! WHAT WERE YOU DOING IN THERE?! TAKING NOTES?!",
+    "{nick}. EVERY CHANNEL YOU SAT IN. WE KNOW ABOUT ALL OF THEM. WE'VE GOT THE TAPES, PAL.",
+    "{nick}! NOBODY HERE KNOWS WHO YOU ARE. NOBODY. {lurking} AND NOT ONE FRIEND.",
+    "{nick}! WHO SENT YOU? WHO'S PAYING YOU TO SIT IN OUR CHANNELS? IS IT THE SCRAPERS? IT'S THE SCRAPERS, ISN'T IT?!",
     "{nick}! NOT ONE WORD SINCE {silent_since}! WHERE WERE YOU ON THE NIGHT OF {silent_since}?!",
 ]
 

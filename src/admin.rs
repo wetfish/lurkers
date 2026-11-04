@@ -5,7 +5,6 @@
 
 use chrono::{Datelike, NaiveDate};
 
-use crate::casemap;
 use crate::config::{Room, Rooms};
 use crate::dates;
 use crate::db::{Db, Frequency, Lurker, Marked};
@@ -55,11 +54,12 @@ type Reply = Result<Vec<String>, Problem>;
 
 /// What a `trusted` or `untrusted` command gives, read in full before
 /// anything is changed, so a mistake anywhere in it changes nothing.
-struct Fields<'a> {
+struct Fields {
     /// The grace period, where None inside means never
     grace: Option<Option<i64>>,
-    /// The channels, each with its own date or the one given with `since=`
-    channels: Vec<(&'a str, NaiveDate)>,
+    /// When they last spoke anywhere
+    silent: Option<NaiveDate>,
+    /// The year they were most active, and how often they chatted then
     peak: Option<(i32, Frequency)>,
 }
 
@@ -73,7 +73,6 @@ pub fn run(context: &Context, text: &str) -> Vec<String> {
     let reply = match command.to_ascii_lowercase().as_str() {
         "trusted" => mark(context, args, Room::Purgatory),
         "untrusted" => mark(context, args, Room::Watchlist),
-        "unchannel" => unchannel(context, args),
         "info" => info(context, args),
         "list" => list(context),
         "forget" => forget(context, args),
@@ -102,23 +101,22 @@ pub fn help(rooms: &Rooms) -> Vec<String> {
     let watchlist = rooms.channel(Room::Watchlist);
     vec![
         format!(
-            "trusted <nick> grace=<time> [#channel=<date> ...] [since=<date>] \
-             [peak=<year>/<daily|weekly|monthly>]: mark or update a lurker for {purgatory}, \
-             someone we know who hasn't been around"
+            "trusted <nick> grace=<time> [silent=<date>] [activity=<daily|weekly|monthly> \
+             year=<year>]: mark or update a lurker for {purgatory}, someone we know who hasn't \
+             been around"
         ),
         format!(
-            "untrusted <nick> grace=<time> [#channel=<date> ...] [since=<date>]: mark or update \
-             a lurker for {watchlist}, someone nobody can vouch for"
+            "untrusted <nick> grace=<time> [silent=<date>]: mark or update a lurker for \
+             {watchlist}, someone nobody can vouch for"
         ),
         "Fields go in any order, and only the ones given change. grace is how long after a \
          warning I kick them from every channel and sajoin them into their room: 90m, 12h, 3d, \
          2w or never. Giving it starts the warning over"
             .to_owned(),
-        "#channel=<date> is when they went silent there: when they last spoke, or showed up if \
-         they never did. Dates are YYYY-MM-DD or days ago, such as 180d. since is the date for \
-         channels given without one, as in since=180d #wetfish #music"
+        "silent is when they last spoke anywhere, or showed up if they never did: YYYY-MM-DD \
+         or days ago, such as 180d. activity and year go together, for trusted lurkers: how \
+         often they chatted in the year they were most active"
             .to_owned(),
-        "unchannel <nick> <#channel>: remove a channel from a lurker".to_owned(),
         "info <nick>: everything recorded about a lurker".to_owned(),
         "list: every lurker, and who is in their room now".to_owned(),
         "forget <nick>: delete a lurker".to_owned(),
@@ -157,8 +155,8 @@ fn mark(context: &Context, args: &[&str], room: Room) -> Reply {
     if let Some(grace) = fields.grace {
         context.db.set_grace(id, grace)?;
     }
-    for (name, since) in &fields.channels {
-        context.db.set_channel(id, name, *since)?;
+    if let Some(silent) = fields.silent {
+        context.db.set_silent(id, silent)?;
     }
     if let Some((year, frequency)) = fields.peak {
         context.db.set_peak(id, year, frequency)?;
@@ -176,6 +174,9 @@ fn mark(context: &Context, args: &[&str], room: Room) -> Reply {
     if let Some(grace) = fields.grace {
         first.push_str(&format!(" {}.", capitalize(&kicked(grace))));
     }
+    if let Some(silent) = fields.silent {
+        first.push_str(&format!(" {}.", capitalize(&silent_since(silent, today))));
+    }
     if let Some((year, frequency)) = fields.peak {
         first.push_str(&format!(" Chatted {} in {year}.", frequency.phrase()));
     }
@@ -185,58 +186,37 @@ fn mark(context: &Context, args: &[&str], room: Room) -> Reply {
         ));
     }
 
-    let mut lines = vec![first];
-    if !fields.channels.is_empty() {
-        let channels = fields
-            .channels
-            .iter()
-            .map(|(name, since)| describe_channel(name, *since, today))
-            .collect();
-        lines.extend(wrap("Channels: ", channels));
-    }
-    Ok(lines)
+    Ok(vec![first])
 }
 
-impl<'a> Fields<'a> {
-    fn parse(args: &[&'a str], room: Room, today: NaiveDate) -> Result<Fields<'a>, Problem> {
+impl Fields {
+    fn parse(args: &[&str], room: Room, today: NaiveDate) -> Result<Fields, Problem> {
         let mut grace = None;
-        let mut since = None;
-        let mut peak = None;
-        let mut channels: Vec<(&str, Option<NaiveDate>)> = Vec::new();
+        let mut silent = None;
+        let mut activity = None;
+        let mut year = None;
 
         for &arg in args {
-            if arg.starts_with('#') {
-                let (name, date) = match arg.split_once('=') {
-                    Some((name, date)) => (name, Some(dates::parse(date, today)?)),
-                    None => (arg, None),
-                };
-                let name = check_channel(name)?;
-                if channels.iter().any(|(seen, _)| casemap::eq(seen, name)) {
-                    return Err(format!("{name} is given twice.").into());
-                }
-                channels.push((name, date));
-                continue;
-            }
-
             let Some((key, value)) = arg.split_once('=') else {
                 return Err(format!(
-                    "{arg} isn't a field. Fields look like grace=3d, since=180d, #wetfish=180d \
-                     and peak=2022/daily."
+                    "{arg} isn't a field. Fields look like grace=3d, silent=180d, activity=daily \
+                     and year=2022."
                 )
                 .into());
             };
             let key = key.to_ascii_lowercase();
             let given_twice = match key.as_str() {
                 "grace" => grace.replace(dates::parse_grace(value)?).is_some(),
-                "since" => since.replace(dates::parse(value, today)?).is_some(),
-                "peak" if room == Room::Watchlist => {
-                    return Err("peak is only for trusted lurkers.".into());
+                "silent" => silent.replace(dates::parse(value, today)?).is_some(),
+                "activity" | "year" if room == Room::Watchlist => {
+                    return Err("activity and year are only for trusted lurkers.".into());
                 }
-                "peak" => peak.replace(parse_peak(value, today)?).is_some(),
+                "activity" => activity.replace(parse_activity(value)?).is_some(),
+                "year" => year.replace(parse_year(value, today)?).is_some(),
                 _ => {
                     return Err(format!(
-                        "I don't know the field {key}. Fields are grace, since, #channel and \
-                         peak."
+                        "I don't know the field {key}. Fields are grace, silent, activity and \
+                         year."
                     )
                     .into());
                 }
@@ -246,79 +226,45 @@ impl<'a> Fields<'a> {
             }
         }
 
-        let mut used_since = false;
-        let mut dated = Vec::new();
-        for (name, date) in channels {
-            let date = match (date, since) {
-                (Some(date), _) => date,
-                (None, Some(since)) => {
-                    used_since = true;
-                    since
-                }
-                (None, None) => {
-                    return Err(format!(
-                        "Give a date for {name}, as {name}=180d, or one for every channel \
-                         without its own with since=180d."
-                    )
-                    .into());
-                }
-            };
-            dated.push((name, date));
-        }
-        if since.is_some() && !used_since {
-            return Err(
-                "since only gives a date to channels listed without one, as in since=180d \
-                 #wetfish."
-                    .into(),
-            );
-        }
+        let peak = match (year, activity) {
+            (Some(year), Some(activity)) => Some((year, activity)),
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "Give activity and year together, such as activity=daily year=2022.".into(),
+                );
+            }
+        };
 
         Ok(Fields {
             grace,
-            channels: dated,
+            silent,
             peak,
         })
     }
 }
 
-/// A peak given as `year/how often`, such as `2022/daily`.
-fn parse_peak(value: &str, today: NaiveDate) -> Result<(i32, Frequency), Problem> {
-    let (year, frequency) = value
-        .split_once('/')
-        .ok_or("Give peak as year/how often, such as peak=2022/daily.")?;
+/// How often a lurker chatted in the year they were most active.
+fn parse_activity(value: &str) -> Result<Frequency, Problem> {
+    Frequency::parse(value).ok_or_else(|| "Give activity as daily, weekly or monthly.".into())
+}
+
+/// The year a lurker was most active.
+fn parse_year(value: &str, today: NaiveDate) -> Result<i32, Problem> {
     let this_year = today.year();
-    let year: i32 = year
-        .parse()
+    value
+        .parse::<i32>()
         .ok()
         .filter(|year| (1988..=this_year).contains(year))
-        .ok_or_else(|| format!("Give the peak year as a number from 1988 to {this_year}."))?;
-    let frequency =
-        Frequency::parse(frequency).ok_or("Give how often as daily, weekly or monthly.")?;
-    Ok((year, frequency))
+        .ok_or_else(|| format!("Give year as a number from 1988 to {this_year}.").into())
 }
 
 fn usage(room: Room) -> String {
     match room {
-        Room::Purgatory => "Usage: trusted <nick> grace=<time> [#channel=<date> ...] \
-                            [since=<date>] [peak=<year>/<daily|weekly|monthly>]"
+        Room::Purgatory => "Usage: trusted <nick> grace=<time> [silent=<date>] \
+                            [activity=<daily|weekly|monthly> year=<year>]"
             .to_owned(),
-        Room::Watchlist => {
-            "Usage: untrusted <nick> grace=<time> [#channel=<date> ...] [since=<date>]".to_owned()
-        }
-    }
-}
-
-fn unchannel(context: &Context, args: &[&str]) -> Reply {
-    let [nick, channel] = args else {
-        return Err("Usage: unchannel <nick> <#channel>".into());
-    };
-    let lurker = find(context, nick)?;
-    let channel = check_channel(channel)?;
-
-    if context.db.remove_channel(lurker.id, channel)? {
-        Ok(vec![format!("{}: removed {channel}.", lurker.nick)])
-    } else {
-        Ok(vec![format!("{} has no {channel}.", lurker.nick)])
+        Room::Watchlist => "Usage: untrusted <nick> grace=<time> [silent=<date>]".to_owned(),
     }
 }
 
@@ -351,18 +297,10 @@ fn info(context: &Context, args: &[&str]) -> Reply {
         dates::today(lurker.marked_at)
     )];
 
-    if lurker.channels.is_empty() {
-        lines.push(format!(
-            "No channels yet. Add them with: {trust} {name} #channel=<date>"
-        ));
-    } else {
-        let channels = lurker
-            .channels
-            .iter()
-            .map(|idle| describe_channel(&idle.channel, idle.since, today))
-            .collect();
-        lines.extend(wrap("Channels: ", channels));
-    }
+    lines.push(match lurker.silent {
+        Some(silent) => format!("{}.", capitalize(&silent_since(silent, today))),
+        None => format!("Silent since: unknown. Add it with: {trust} {name} silent=<date>"),
+    });
 
     lines.push(match (lurker.next_ping_at, lurker.here_since) {
         (Some(at), _) if at > context.now => format!(
@@ -404,7 +342,7 @@ fn info(context: &Context, args: &[&str]) -> Reply {
             }
             None => format!(
                 "Most active: unknown. Add it with: trusted {name} \
-                 peak=<year>/<daily|weekly|monthly>"
+                 activity=<daily|weekly|monthly> year=<year>"
             ),
         });
     }
@@ -425,11 +363,11 @@ fn as_command(lurker: &Lurker) -> String {
         None => "never".to_owned(),
     };
     let mut command = format!("{} {} grace={grace}", trust(lurker.room), lurker.nick);
-    for idle in &lurker.channels {
-        command.push_str(&format!(" {}={}", idle.channel, idle.since));
+    if let Some(silent) = lurker.silent {
+        command.push_str(&format!(" silent={silent}"));
     }
     if let (Room::Purgatory, Some((year, frequency))) = (lurker.room, lurker.peak) {
-        command.push_str(&format!(" peak={year}/{}", frequency.as_str()));
+        command.push_str(&format!(" activity={} year={year}", frequency.as_str()));
     }
     command
 }
@@ -492,18 +430,11 @@ fn check_nick(nick: &str) -> Result<&str, Problem> {
     Ok(nick)
 }
 
-fn check_channel(channel: &str) -> Result<&str, Problem> {
-    if !channel.starts_with('#') || channel.len() < 2 || channel.contains(',') {
-        return Err(format!("{channel} isn't a channel. Channels start with #.").into());
-    }
-    Ok(channel)
-}
-
-/// A channel and when the lurker went silent there, such as "#wetfish
-/// silent since 2026-05-06 (180 days)".
-fn describe_channel(channel: &str, since: NaiveDate, today: NaiveDate) -> String {
+/// When a lurker went silent, such as "silent since 2026-05-06 (180
+/// days)".
+fn silent_since(since: NaiveDate, today: NaiveDate) -> String {
     format!(
-        "{channel} silent since {since} ({})",
+        "silent since {since} ({})",
         dates::days(dates::days_since(since, today))
     )
 }
@@ -604,13 +535,9 @@ mod tests {
             self.db.lurker(nick).unwrap().unwrap()
         }
 
-        /// A lurker's channels as `#channel=date`.
-        fn channels(&self, nick: &str) -> Vec<String> {
-            self.lurker(nick)
-                .channels
-                .iter()
-                .map(|idle| format!("{}={}", idle.channel, idle.since))
-                .collect()
+        /// When a lurker went silent, as `YYYY-MM-DD`.
+        fn silent(&self, nick: &str) -> Option<String> {
+            self.lurker(nick).silent.map(|date| date.to_string())
         }
     }
 
@@ -620,13 +547,10 @@ mod tests {
         fixture.presence.add("#purgatory", "alice");
 
         assert_eq!(
-            fixture
-                .run("trusted alice grace=3d #wetfish=348d #dryfish=2026-11-01 peak=2022/weekly"),
+            fixture.run("trusted alice grace=3d silent=348d activity=weekly year=2022"),
             [
                 "alice is marked trusted (#purgatory). Kicked from every channel 3 days after being \
-                 warned. Chatted every week in 2022.",
-                "Channels: #wetfish silent since 2025-11-19 (348 days), #dryfish silent since \
-                 2026-11-01 (1 day)",
+                 warned. Silent since 2025-11-19 (348 days). Chatted every week in 2022."
             ]
         );
 
@@ -636,61 +560,63 @@ mod tests {
         assert_eq!(alice.marked_by, "rachel");
         assert_eq!(alice.grace, Some(3 * DAY));
         assert_eq!(alice.peak, Some((2022, Frequency::Weekly)));
-        assert_eq!(
-            fixture.channels("alice"),
-            ["#dryfish=2026-11-01", "#wetfish=2025-11-19"]
-        );
+        assert_eq!(fixture.silent("alice").as_deref(), Some("2025-11-19"));
     }
 
     #[test]
     fn takes_fields_in_any_order() {
         let fixture = Fixture::new();
         assert_eq!(
-            fixture.run("untrusted bob #music since=180d #wetfish=95d GRACE=12h"),
+            fixture.run("untrusted bob SILENT=2026-05-06 GRACE=12h"),
             [
                 "bob is marked untrusted (#FBI_watchlist). Kicked from every channel 12 hours after \
-                 being warned. Their time in #FBI_watchlist starts counting when they join it.",
-                "Channels: #music silent since 2026-05-06 (180 days), #wetfish silent since \
-                 2026-07-30 (95 days)",
+                 being warned. Silent since 2026-05-06 (180 days). Their time in #FBI_watchlist \
+                 starts counting when they join it."
             ]
         );
         assert_eq!(fixture.lurker("bob").grace, Some(12 * 3600));
+        assert_eq!(fixture.silent("bob").as_deref(), Some("2026-05-06"));
+
+        fixture.run("trusted carol year=2019 grace=1w activity=MONTHLY");
         assert_eq!(
-            fixture.channels("bob"),
-            ["#music=2026-05-06", "#wetfish=2026-07-30"]
+            fixture.lurker("carol").peak,
+            Some((2019, Frequency::Monthly))
         );
     }
 
     #[test]
     fn updates_only_what_is_given() {
         let fixture = Fixture::new();
-        fixture.run("untrusted bob grace=3d #wetfish=180d");
+        fixture.run("trusted alice grace=3d silent=180d activity=daily year=2022");
 
         assert_eq!(
-            fixture.run("untrusted bob grace=never #music=10d #WETFISH=95d"),
+            fixture.run("trusted alice grace=never silent=95d"),
             [
-                "bob is already marked untrusted (#FBI_watchlist). Never warned or kicked.",
-                "Channels: #music silent since 2026-10-23 (10 days), #WETFISH silent since \
-                 2026-07-30 (95 days)",
+                "alice is already marked trusted (#purgatory). Never warned or kicked. Silent \
+                 since 2026-07-30 (95 days)."
             ]
         );
-        assert_eq!(fixture.lurker("bob").grace, None);
-        assert_eq!(
-            fixture.channels("bob"),
-            ["#music=2026-10-23", "#WETFISH=2026-07-30"]
-        );
+        let alice = fixture.lurker("alice");
+        assert_eq!(alice.grace, None);
+        assert_eq!(alice.peak, Some((2022, Frequency::Daily)));
+        assert_eq!(fixture.silent("alice").as_deref(), Some("2026-07-30"));
+
+        fixture.run("trusted alice activity=weekly year=2023");
+        let alice = fixture.lurker("alice");
+        assert_eq!(alice.peak, Some((2023, Frequency::Weekly)));
+        assert_eq!(fixture.silent("alice").as_deref(), Some("2026-07-30"));
 
         assert_eq!(
-            fixture.run("untrusted bob"),
-            ["bob is already marked untrusted (#FBI_watchlist)."]
+            fixture.run("trusted alice"),
+            ["alice is already marked trusted (#purgatory)."]
         );
-        assert_eq!(fixture.channels("bob").len(), 2);
+        assert_eq!(fixture.silent("alice").as_deref(), Some("2026-07-30"));
     }
 
     #[test]
     fn moves_lurkers_between_rooms() {
         let fixture = Fixture::new();
-        fixture.run("untrusted bob grace=3d #wetfish=180d");
+        fixture.run("untrusted bob grace=3d silent=180d");
         assert_eq!(
             fixture.run("trusted bob"),
             [
@@ -701,14 +627,14 @@ mod tests {
         let bob = fixture.lurker("bob");
         assert_eq!(bob.room, Room::Purgatory);
         assert_eq!(bob.grace, Some(3 * DAY));
-        assert_eq!(bob.channels.len(), 1);
+        assert_eq!(fixture.silent("bob").as_deref(), Some("2026-05-06"));
     }
 
     #[test]
     fn needs_a_grace_period_to_mark_someone_new() {
         let fixture = Fixture::new();
         assert_eq!(
-            fixture.run("trusted alice #wetfish=1d"),
+            fixture.run("trusted alice silent=1d"),
             [
                 "Give a grace period too, such as: trusted alice grace=3d. It is how long after \
                  a warning I kick them from every channel and sajoin them into their room, or \
@@ -723,8 +649,12 @@ mod tests {
         let fixture = Fixture::new();
         for (command, reply) in [
             (
-                "untrusted bob grace=3d peak=2022/daily",
-                "peak is only for trusted lurkers.",
+                "untrusted bob grace=3d activity=daily year=2022",
+                "activity and year are only for trusted lurkers.",
+            ),
+            (
+                "untrusted bob grace=3d year=2022",
+                "activity and year are only for trusted lurkers.",
             ),
             (
                 "trusted bob grace=soon",
@@ -732,53 +662,63 @@ mod tests {
                  90m, 12h, 3d or 2w, or never",
             ),
             (
-                "trusted bob grace=3d #wetfish",
-                "Give a date for #wetfish, as #wetfish=180d, or one for every channel without its \
-                 own with since=180d.",
+                "trusted bob grace=3d activity=daily",
+                "Give activity and year together, such as activity=daily year=2022.",
             ),
             (
-                "trusted bob grace=3d since=10d #wetfish=1d",
-                "since only gives a date to channels listed without one, as in since=180d \
-                 #wetfish.",
+                "trusted bob grace=3d year=2022",
+                "Give activity and year together, such as activity=daily year=2022.",
             ),
             ("trusted bob grace=3d grace=1d", "grace is given twice."),
             (
-                "trusted bob grace=3d #wetfish=1d #WETFISH=2d",
-                "#WETFISH is given twice.",
+                "trusted bob grace=3d silent=1d SILENT=2d",
+                "silent is given twice.",
             ),
             (
                 "trusted bob grace=3d color=blue",
-                "I don't know the field color. Fields are grace, since, #channel and peak.",
+                "I don't know the field color. Fields are grace, silent, activity and year.",
+            ),
+            (
+                "trusted bob grace=3d #wetfish=180d",
+                "I don't know the field #wetfish. Fields are grace, silent, activity and year.",
+            ),
+            (
+                "trusted bob grace=3d since=180d",
+                "I don't know the field since. Fields are grace, silent, activity and year.",
+            ),
+            (
+                "trusted bob grace=3d peak=2022/daily",
+                "I don't know the field peak. Fields are grace, silent, activity and year.",
             ),
             (
                 "trusted bob grace=3d 180d",
-                "180d isn't a field. Fields look like grace=3d, since=180d, #wetfish=180d and \
-                 peak=2022/daily.",
+                "180d isn't a field. Fields look like grace=3d, silent=180d, activity=daily and \
+                 year=2022.",
             ),
             (
-                "trusted bob grace=3d #wetfish=2027-01-01",
+                "trusted bob grace=3d silent=2027-01-01",
                 "2027-01-01 is in the future",
             ),
             (
-                "trusted bob grace=3d #=1d",
-                "# isn't a channel. Channels start with #.",
+                "trusted bob grace=3d activity=daily year=2030",
+                "Give year as a number from 1988 to 2026.",
             ),
             (
-                "trusted bob grace=3d peak=2030/daily",
-                "Give the peak year as a number from 1988 to 2026.",
+                "trusted bob grace=3d activity=daily year=twenty",
+                "Give year as a number from 1988 to 2026.",
             ),
             (
-                "trusted bob grace=3d peak=2022/hourly",
-                "Give how often as daily, weekly or monthly.",
-            ),
-            (
-                "trusted bob grace=3d peak=2022",
-                "Give peak as year/how often, such as peak=2022/daily.",
+                "trusted bob grace=3d activity=hourly year=2022",
+                "Give activity as daily, weekly or monthly.",
             ),
             (
                 "trusted",
-                "Usage: trusted <nick> grace=<time> [#channel=<date> ...] [since=<date>] \
-                 [peak=<year>/<daily|weekly|monthly>]",
+                "Usage: trusted <nick> grace=<time> [silent=<date>] \
+                 [activity=<daily|weekly|monthly> year=<year>]",
+            ),
+            (
+                "untrusted",
+                "Usage: untrusted <nick> grace=<time> [silent=<date>]",
             ),
             ("trusted #wetfish grace=3d", "#wetfish isn't a nick."),
             ("trusted grace=3d", "grace=3d isn't a nick."),
@@ -789,39 +729,35 @@ mod tests {
     }
 
     #[test]
-    fn removes_channels() {
-        let fixture = Fixture::new();
-        fixture.run("trusted alice grace=3d #wetfish=1d #dryfish=1d");
-        assert_eq!(
-            fixture.run("unchannel alice #WETFISH"),
-            ["alice: removed #WETFISH."]
-        );
-        assert_eq!(
-            fixture.run("unchannel alice #wetfish"),
-            ["alice has no #wetfish."]
-        );
-        assert_eq!(fixture.channels("alice"), ["#dryfish=2026-11-01"]);
-    }
-
-    #[test]
     fn shows_info() {
         let mut fixture = Fixture::new();
         fixture.presence.add("#purgatory", "alice");
-        fixture.run("trusted alice grace=3d #wetfish=348d #dryfish=1d peak=2022/weekly");
+        fixture.run("trusted alice grace=3d silent=348d activity=weekly year=2022");
 
         assert_eq!(
             fixture.run("info ALICE"),
             [
                 "alice: trusted (#purgatory), in the room now, 0 days since first seen there. \
                  Marked by rachel on 2026-11-02.",
-                "Channels: #dryfish silent since 2026-11-01 (1 day), #wetfish silent since \
-                 2025-11-19 (348 days)",
+                "Silent since 2025-11-19 (348 days).",
                 "Next ping: being scheduled.",
                 "Kicks: warned the next time I find them online, and kicked 3 days later.",
                 "Most active: chatted every week in 2022.",
-                "As one command: trusted alice grace=3d #dryfish=2026-11-01 #wetfish=2025-11-19 \
-                 peak=2022/weekly",
+                "As one command: trusted alice grace=3d silent=2025-11-19 activity=weekly \
+                 year=2022",
             ]
+        );
+
+        fixture.run("trusted carol grace=1d");
+        let info = fixture.run("info carol");
+        assert_eq!(
+            info[1],
+            "Silent since: unknown. Add it with: trusted carol silent=<date>"
+        );
+        assert_eq!(
+            info[4],
+            "Most active: unknown. Add it with: trusted carol activity=<daily|weekly|monthly> \
+             year=<year>"
         );
 
         fixture.run("untrusted bob grace=never");
@@ -830,7 +766,7 @@ mod tests {
             [
                 "bob: untrusted (#FBI_watchlist), not in the room now, not seen there yet. \
                  Marked by rachel on 2026-11-02.",
-                "No channels yet. Add them with: untrusted bob #channel=<date>",
+                "Silent since: unknown. Add it with: untrusted bob silent=<date>",
                 "Next ping: after they first join #FBI_watchlist.",
                 "Kicks: never warned or kicked.",
                 "As one command: untrusted bob grace=never",
@@ -841,22 +777,30 @@ mod tests {
     #[test]
     fn the_info_command_marks_the_same_lurker() {
         let fixture = Fixture::new();
-        fixture.run("trusted alice grace=90m since=348d #wetfish #dryfish peak=2022/daily");
-        let info = fixture.run("info alice");
-        let command = info
-            .last()
-            .unwrap()
-            .strip_prefix("As one command: ")
-            .unwrap();
-        let before = fixture.lurker("alice");
+        for (nick, command) in [
+            (
+                "alice",
+                "trusted alice grace=90m silent=348d activity=daily year=2022",
+            ),
+            ("bob", "untrusted bob grace=2w silent=2026-05-06"),
+        ] {
+            fixture.run(command);
+            let info = fixture.run(&format!("info {nick}"));
+            let command = info
+                .last()
+                .unwrap()
+                .strip_prefix("As one command: ")
+                .unwrap();
+            let before = fixture.lurker(nick);
 
-        fixture.run("forget alice");
-        fixture.run(command);
-        let after = fixture.lurker("alice");
-        assert_eq!(
-            (&after.channels, after.grace, after.peak, after.room),
-            (&before.channels, before.grace, before.peak, before.room)
-        );
+            fixture.run(&format!("forget {nick}"));
+            fixture.run(command);
+            let after = fixture.lurker(nick);
+            assert_eq!(
+                (after.silent, after.grace, after.peak, after.room),
+                (before.silent, before.grace, before.peak, before.room)
+            );
+        }
     }
 
     #[test]
@@ -950,6 +894,7 @@ mod tests {
             "grace bob 3d",
             "channel bob #wetfish 1d",
             "peak bob 2022 daily",
+            "unchannel bob #wetfish",
         ] {
             let reply = fixture.run(removed);
             assert!(
@@ -957,8 +902,8 @@ mod tests {
                 "{reply:?}"
             );
         }
-        assert_eq!(fixture.run("help").len(), 13);
-        assert_eq!(fixture.run("").len(), 13);
+        assert_eq!(fixture.run("help").len(), 12);
+        assert_eq!(fixture.run("").len(), 12);
         assert!(
             fixture
                 .run("help")

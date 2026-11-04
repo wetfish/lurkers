@@ -1,8 +1,7 @@
 //! The SQLite database where lurker keeps the lurkers admins have marked, so
 //! they survive restarts.
 //!
-//! `lurkers` has one row per marked user, and `lurker_channels` the channels
-//! an admin said each of them idled in. `used_pings` remembers which ping
+//! `lurkers` has one row per marked user. `used_pings` remembers which ping
 //! messages each lurker has heard, and `channels` the channels admins asked
 //! lurker to join besides its rooms. Nobody else is recorded: people who
 //! aren't marked are left alone.
@@ -22,7 +21,7 @@ use crate::config::Room;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 4] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
+const MIGRATIONS: [&str; 5] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE lurkers (
@@ -98,6 +97,16 @@ const SCHEMA_V4: &str = "
 ALTER TABLE lurkers ADD COLUMN spoke_at INTEGER;
 ";
 
+const SCHEMA_V5: &str = "
+-- When they went silent, as YYYY-MM-DD: when they last spoke anywhere, or
+-- were first seen if they never spoke. Lurkers marked before this was added
+-- keep the most recent of their channels' dates.
+ALTER TABLE lurkers ADD COLUMN silent_since TEXT;
+UPDATE lurkers SET silent_since =
+    (SELECT max(since) FROM lurker_channels WHERE lurker_id = lurkers.id);
+DROP TABLE lurker_channels;
+";
+
 /// How often a lurker chatted in the year they were most active.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Frequency {
@@ -141,7 +150,9 @@ pub struct Lurker {
     pub nick: String,
     /// #purgatory for a trusted lurker, #FBI_watchlist for an untrusted one
     pub room: Room,
-    pub channels: Vec<IdleChannel>,
+    /// When they went silent: when they last spoke anywhere, or were first
+    /// seen if they never spoke
+    pub silent: Option<NaiveDate>,
     /// The year they were most active, and how often they chatted then
     pub peak: Option<(i32, Frequency)>,
     /// When lurker first saw them in their room
@@ -173,15 +184,6 @@ impl Lurker {
     pub fn released(&self) -> bool {
         matches!((self.warned_at, self.spoke_at), (Some(warned), Some(spoke)) if spoke > warned)
     }
-}
-
-/// A channel a lurker idled in.
-#[derive(Debug, Clone, PartialEq)]
-pub struct IdleChannel {
-    pub channel: String,
-    /// When they went silent there: when they last spoke, or were first seen
-    /// if they never spoke
-    pub since: NaiveDate,
 }
 
 /// What marking someone changed.
@@ -327,25 +329,13 @@ impl Db {
         Ok(deleted > 0)
     }
 
-    /// Adds a channel a lurker idled in, or changes its date.
-    pub fn set_channel(&self, id: i64, channel: &str, since: NaiveDate) -> rusqlite::Result<()> {
+    /// Records when a lurker went silent.
+    pub fn set_silent(&self, id: i64, since: NaiveDate) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO lurker_channels (lurker_id, channel, channel_key, since)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (lurker_id, channel_key)
-             DO UPDATE SET channel = excluded.channel, since = excluded.since",
-            params![id, channel, casemap::fold(channel), since.to_string()],
+            "UPDATE lurkers SET silent_since = ?2 WHERE id = ?1",
+            params![id, since.to_string()],
         )?;
         Ok(())
-    }
-
-    /// Removes a channel from a lurker. Returns false when it wasn't theirs.
-    pub fn remove_channel(&self, id: i64, channel: &str) -> rusqlite::Result<bool> {
-        let deleted = self.conn.execute(
-            "DELETE FROM lurker_channels WHERE lurker_id = ?1 AND channel_key = ?2",
-            params![id, casemap::fold(channel)],
-        )?;
-        Ok(deleted > 0)
     }
 
     /// Records the year a lurker was most active, and how often they chatted.
@@ -497,21 +487,23 @@ impl Db {
     }
 
     fn load(&self, id: i64) -> rusqlite::Result<Lurker> {
-        let mut lurker = self.conn.query_row(
+        self.conn.query_row(
             "SELECT nick, room, peak_year, peak_frequency, here_since, marked_by, marked_at,
-                    next_ping_at, fanfare_at, grace, warned_at, spoke_at
+                    next_ping_at, fanfare_at, grace, warned_at, spoke_at, silent_since
              FROM lurkers WHERE id = ?1",
             [id],
             |row| {
                 let room: String = row.get(1)?;
                 let peak_year: Option<i32> = row.get(2)?;
                 let peak_frequency: Option<String> = row.get(3)?;
+                let silent: Option<String> = row.get(12)?;
                 Ok(Lurker {
                     id,
                     nick: row.get(0)?,
                     // The schema only allows the two rooms' names
                     room: Room::parse(&room).unwrap_or(Room::Purgatory),
-                    channels: Vec::new(),
+                    silent: silent
+                        .and_then(|since| NaiveDate::parse_from_str(&since, "%Y-%m-%d").ok()),
                     peak: peak_year.zip(peak_frequency.as_deref().and_then(Frequency::parse)),
                     here_since: row.get(4)?,
                     marked_by: row.get(5)?,
@@ -523,25 +515,7 @@ impl Db {
                     spoke_at: row.get(11)?,
                 })
             },
-        )?;
-
-        let mut statement = self.conn.prepare(
-            "SELECT channel, since FROM lurker_channels WHERE lurker_id = ?1 ORDER BY channel_key",
-        )?;
-        let rows = statement
-            .query_map([id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        lurker.channels = rows
-            .into_iter()
-            .filter_map(|(channel, since)| {
-                let since = NaiveDate::parse_from_str(&since, "%Y-%m-%d").ok()?;
-                Some(IdleChannel { channel, since })
-            })
-            .collect();
-
-        Ok(lurker)
+        )
     }
 }
 
@@ -605,6 +579,43 @@ mod tests {
         assert_eq!(alice.next_ping_at, None);
         assert_eq!(alice.fanfare_at, None);
         assert_eq!((alice.warned_at, alice.spoke_at), (None, None));
+        assert_eq!(alice.silent, None);
+    }
+
+    #[test]
+    fn keeps_the_most_recent_channel_date_as_the_silent_date() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA foreign_keys = ON; {SCHEMA_V1} {SCHEMA_V2} {SCHEMA_V3} {SCHEMA_V4} \
+             PRAGMA user_version = 4;"
+        ))
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO lurkers (id, nick, nick_key, room, marked_by, marked_at)
+             VALUES (1, 'alice', 'alice', 'purgatory', 'rachel', 100),
+                    (2, 'bob', 'bob', 'watchlist', 'rachel', 100);
+             INSERT INTO lurker_channels (lurker_id, channel, channel_key, since)
+             VALUES (1, '#wetfish', '#wetfish', '2024-11-19'),
+                    (1, '#dryfish', '#dryfish', '2025-11-19'),
+                    (1, '#music', '#music', '2025-01-01');",
+        )
+        .unwrap();
+
+        let db = Db::setup(conn).unwrap();
+        assert_eq!(
+            db.lurker("alice").unwrap().unwrap().silent,
+            Some(date("2025-11-19"))
+        );
+        assert_eq!(db.lurker("bob").unwrap().unwrap().silent, None);
+        let tables: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'lurker_channels'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
     }
 
     #[test]
@@ -744,36 +755,20 @@ mod tests {
     }
 
     #[test]
-    fn keeps_channels_and_peak() {
+    fn keeps_the_silent_date_and_peak() {
         let db = Db::open_in_memory();
         db.mark("alice", Room::Purgatory, false, "rachel", 100)
             .unwrap();
         let id = db.lurker("alice").unwrap().unwrap().id;
+        assert_eq!(db.lurker("alice").unwrap().unwrap().silent, None);
 
-        db.set_channel(id, "#wetfish", date("2024-11-19")).unwrap();
-        db.set_channel(id, "#Dryfish", date("2025-01-01")).unwrap();
-        db.set_channel(id, "#WETFISH", date("2024-12-01")).unwrap();
+        db.set_silent(id, date("2024-11-19")).unwrap();
+        db.set_silent(id, date("2025-01-01")).unwrap();
         db.set_peak(id, 2022, Frequency::Daily).unwrap();
 
         let alice = db.lurker("alice").unwrap().unwrap();
-        assert_eq!(
-            alice.channels,
-            [
-                IdleChannel {
-                    channel: "#Dryfish".to_owned(),
-                    since: date("2025-01-01")
-                },
-                IdleChannel {
-                    channel: "#WETFISH".to_owned(),
-                    since: date("2024-12-01")
-                },
-            ]
-        );
+        assert_eq!(alice.silent, Some(date("2025-01-01")));
         assert_eq!(alice.peak, Some((2022, Frequency::Daily)));
-
-        assert!(db.remove_channel(id, "#dryfish").unwrap());
-        assert!(!db.remove_channel(id, "#dryfish").unwrap());
-        assert_eq!(db.lurker("alice").unwrap().unwrap().channels.len(), 1);
     }
 
     #[test]
@@ -795,20 +790,21 @@ mod tests {
     }
 
     #[test]
-    fn forgets_lurkers_and_their_channels() {
+    fn forgets_lurkers_and_their_pings() {
         let db = Db::open_in_memory();
         db.mark("alice", Room::Purgatory, false, "rachel", 100)
             .unwrap();
         let id = db.lurker("alice").unwrap().unwrap().id;
-        db.set_channel(id, "#wetfish", date("2024-11-19")).unwrap();
+        db.use_ping(id, 2).unwrap();
 
         assert!(db.forget("Alice").unwrap());
         assert!(!db.forget("alice").unwrap());
-        let channels: i64 = db
+        assert_eq!(db.lurker("alice").unwrap(), None);
+        let pings: i64 = db
             .conn
-            .query_row("SELECT count(*) FROM lurker_channels", [], |row| row.get(0))
+            .query_row("SELECT count(*) FROM used_pings", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(channels, 0);
+        assert_eq!(pings, 0);
     }
 
     #[test]
