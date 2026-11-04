@@ -73,8 +73,8 @@ after a kick or a ban.
 As an IRC operator, lurker gives itself +o with SAMODE in each of these
 channels where it isn't opped, but not in its rooms. If someone takes +o
 away, it waits 10 minutes before taking it back, so it never fights anyone
-over it. To kick a lurker where it isn't opped, it ops itself for the kick
-and deops itself straight after.
+over it. To kick a lurker where it isn't opped, it ops itself first, and
+keeps +o afterwards everywhere but its rooms.
 
 ## Staying connected
 

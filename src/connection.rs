@@ -1142,8 +1142,8 @@ impl<'a> Session<'a> {
     /// In a channel lurker isn't in, it sajoins itself, which gets past
     /// bans, keys, invite-only and limits, ops itself, kicks, and leaves
     /// again, unless the channel is one of its own. Where it isn't opped, it
-    /// ops itself for the kick and deops itself after it, apart from in a
-    /// channel admins invited it to that it is only now joining, where it
+    /// ops itself for the kick. It deops itself after it only in its rooms,
+    /// where it never keeps +o; in the channels admins invited it to, it
     /// keeps +o as it always does there.
     fn kick(&mut self, channel: &str, nick: &str, reason: String) -> Vec<Command> {
         let key = casemap::fold(channel);
@@ -1169,7 +1169,7 @@ impl<'a> Session<'a> {
         if !own {
             commands.push(Command::PART(channel.to_owned(), None));
             *self.visiting.entry(key).or_default() += 1;
-        } else if inside || self.room_of(channel).is_some() {
+        } else if self.room_of(channel).is_some() {
             commands.push(mode("-o"));
         }
         commands
@@ -2347,10 +2347,9 @@ mod tests {
             [
                 // Opped already
                 "KICK #wetfish bob",
-                // Not opped: opped just for the kick
+                // One of its channels where it isn't opped: it keeps +o
                 "SAMODE #music +o lurker",
                 "KICK #music bob",
-                "SAMODE #music -o lurker",
                 // The other room, where lurker never keeps +o
                 "SAMODE #purgatory +o lurker",
                 "KICK #purgatory bob",
