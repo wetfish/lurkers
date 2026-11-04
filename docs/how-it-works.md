@@ -72,6 +72,39 @@ The notice looks like this. Admins who aren't online miss it:
 
 What lurker says is in `messages.toml`; see [Messages](messages.md).
 
+## Nudges
+
+lurker reminds the people on the [nudge list](commands.md#nudges) to chat,
+as an IRC operator. They don't have to be lurkers, and nudges never warn or
+kick anyone.
+
+1. **Reminders:** spread evenly over the nudge, such as one about every 4
+   days for `for=3w reminders=5`. The first goes out as soon as lurker
+   finds them online. Each one is a mention in every channel they are in,
+   secret ones included, sajoining itself into those it isn't in.
+2. **Listening:** lurker stays in those channels while the nudge is going,
+   and rejoins them after a restart, so it hears them answer.
+3. **They speak:** saying anything in a channel lurker is in, including
+   with `/me`, ends the nudge, and every admin gets a notice:
+
+   ```text
+   Nudge: alice spoke in #anime 2 days after the first reminder, with 2 of 5 reminders sent, so the reminders stopped: "oh hi"
+   ```
+
+4. **It runs out:** when its time is up without a word, every admin gets a
+   notice to review it:
+
+   ```text
+   Nudge: bob's nudge is over, with no reply after 5 reminders. Over to you to review; nudge list has the rest.
+   ```
+
+When a nudge ends for any reason, including `nudge remove` or marking them
+as a lurker, lurker leaves the channels it was in only for it. A reminder
+waits while they are offline, and while lurker sent another nudge reminder
+in one of their channels in the last 20 minutes; reminders that come late
+are still a whole gap apart. Admins who aren't online miss the notices, and
+`nudge list` keeps how every nudge went.
+
 ## Its channels
 
 lurker joins its two rooms and the [channels admins invite it

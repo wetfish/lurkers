@@ -1,12 +1,12 @@
 //! What lurker says to lurkers: the templates in `messages.toml`, which are
-//! built into lurker, filled in with what is recorded about a lurker. Also
-//! the notices admins get.
+//! built into lurker, filled in with what is recorded about a lurker, and
+//! the nudge reminders. Also the notices admins get.
 
 use chrono::NaiveDate;
 use serde::Deserialize;
 
 use crate::config::Room;
-use crate::db::Lurker;
+use crate::db::{Lurker, Nudge};
 use crate::rng::Rng;
 use crate::units::{self, Unit};
 
@@ -39,6 +39,8 @@ pub struct Facts<'a> {
 pub struct Messages {
     purgatory: Set,
     watchlist: Set,
+    /// The nudge reminders, with `{nick}` and `{channel}` in them
+    reminders: Vec<String>,
 }
 
 /// One room's messages.
@@ -55,6 +57,13 @@ struct Set {
 struct File {
     purgatory: FileSet,
     watchlist: FileSet,
+    nudge: NudgeSet,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NudgeSet {
+    reminder: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -120,7 +129,23 @@ impl Messages {
         Ok(Messages {
             purgatory: Set::parse(file.purgatory, Room::Purgatory)?,
             watchlist: Set::parse(file.watchlist, Room::Watchlist)?,
+            reminders: parse_reminders(file.nudge.reminder)?,
         })
+    }
+
+    /// A nudge's reminder, for one of the channels it is sent in. A nudge
+    /// goes through the reminders in turn, starting at a place of its own,
+    /// so each of its reminders is different until all have been used.
+    pub fn reminder(&self, nudge: &Nudge, channel: &str) -> String {
+        let count = self.reminders.len() as i64;
+        let index = (nudge.id + nudge.sent).rem_euclid(count.max(1)) as usize;
+        self.reminders
+            .get(index)
+            .map(|text| {
+                text.replace("{nick}", &nudge.nick)
+                    .replace("{channel}", channel)
+            })
+            .unwrap_or_default()
     }
 
     fn templates(&self, room: Room, kind: Kind) -> &[Template] {
@@ -308,6 +333,75 @@ impl Template {
     }
 }
 
+/// Checks the nudge reminders: at least one, each naming `{nick}`, and no
+/// placeholders but `{nick}` and `{channel}`.
+fn parse_reminders(texts: Vec<String>) -> Result<Vec<String>, String> {
+    if texts.is_empty() {
+        return Err("nudge.reminder needs at least one message".to_owned());
+    }
+    for (index, text) in texts.iter().enumerate() {
+        let problem = |what: &str| format!("nudge.reminder, message {}: {what}", index + 1);
+        if !text.contains("{nick}") {
+            return Err(problem("it needs {nick}, so they are highlighted"));
+        }
+        let bare = text.replace("{nick}", "").replace("{channel}", "");
+        if bare.contains(['{', '}']) {
+            return Err(problem(
+                "reminders can only use the placeholders {nick} and {channel}",
+            ));
+        }
+    }
+    Ok(texts)
+}
+
+/// The notice admins get when someone being nudged speaks, which ends
+/// their nudge.
+pub fn nudge_spoke_notice(nudge: &Nudge, channel: &str, said: &str, now: i64) -> String {
+    let when = match nudge.first_reminder_at {
+        Some(first) => format!(
+            "{} after the first reminder, with {} of {} sent",
+            crate::dates::about(now - first),
+            nudge.sent,
+            reminders(nudge.reminders)
+        ),
+        None => "before the first reminder".to_owned(),
+    };
+    format!(
+        "Nudge: {} spoke in {channel} {when}, so the reminders stopped: \"{}\"",
+        nudge.nick,
+        quote(said)
+    )
+}
+
+/// The notice admins get when a nudge's time is up without a reply, for
+/// them to review.
+pub fn nudge_over_notice(nudge: &Nudge) -> String {
+    if nudge.sent == 0 {
+        format!(
+            "Nudge: {}'s nudge is over without a reply. They weren't online for any of its {}. \
+             Over to you to review; nudge list has the rest.",
+            nudge.nick,
+            reminders(nudge.reminders)
+        )
+    } else {
+        format!(
+            "Nudge: {}'s nudge is over, with no reply after {}. Over to you to review; nudge \
+             list has the rest.",
+            nudge.nick,
+            reminders(nudge.sent)
+        )
+    }
+}
+
+/// A number of reminders, such as "1 reminder" or "5 reminders".
+fn reminders(count: i64) -> String {
+    if count == 1 {
+        "1 reminder".to_owned()
+    } else {
+        format!("{count} reminders")
+    }
+}
+
 /// The notice admins get when a lurker speaks in their room.
 pub fn notice(channel: &str, lurker: &Lurker, said: &str, now: i64) -> String {
     let days = units::days();
@@ -459,6 +553,89 @@ mod tests {
         assert_eq!(count(Room::Watchlist, Kind::Fanfare), 5);
         assert_eq!(count(Room::Watchlist, Kind::Warning), 3);
         assert_eq!(count(Room::Watchlist, Kind::Kick), 3);
+        assert_eq!(messages.reminders.len(), 6);
+    }
+
+    fn nudge(id: i64, sent: i64) -> Nudge {
+        Nudge {
+            id,
+            nick: "Alice".to_owned(),
+            length: 21 * DAY,
+            reminders: 5,
+            added_by: "rachel".to_owned(),
+            added_at: NOW - 3 * DAY,
+            sent,
+            first_reminder_at: Some(NOW - 2 * DAY),
+            last_reminder_at: Some(NOW - 2 * DAY),
+            spoke_at: None,
+            ended_at: None,
+            ended: None,
+            ended_by: None,
+        }
+    }
+
+    #[test]
+    fn fills_in_nudge_reminders_without_repeating_them() {
+        let messages = Messages::builtin().unwrap();
+        let texts: Vec<String> = (0..6)
+            .map(|sent| messages.reminder(&nudge(4, sent), "#anime"))
+            .collect();
+        for text in &texts {
+            assert!(text.starts_with("Alice: "), "{text}");
+            assert!(!text.contains(['{', '}']), "{text}");
+        }
+        let mut unique = texts.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 6, "{texts:?}");
+        assert!(
+            texts.iter().any(|text| text.contains("everyone in #anime")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_nudge_reminders() {
+        for texts in [
+            vec![],
+            vec!["hello there".to_owned()],
+            vec!["{nick}: you've been idle for {idle}".to_owned()],
+            vec!["{nick}: oops }".to_owned()],
+        ] {
+            assert!(
+                parse_reminders(texts.clone()).is_err(),
+                "accepted {texts:?}"
+            );
+        }
+        assert!(parse_reminders(vec!["{nick}: hi from {channel}".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn tells_admins_how_a_nudge_went() {
+        assert_eq!(
+            nudge_spoke_notice(&nudge(1, 2), "#anime", "oh hi, I'm still here", NOW),
+            "Nudge: Alice spoke in #anime 2 days after the first reminder, with 2 of 5 \
+             reminders sent, so the reminders stopped: \"oh hi, I'm still here\""
+        );
+        let early = Nudge {
+            first_reminder_at: None,
+            ..nudge(1, 0)
+        };
+        assert_eq!(
+            nudge_spoke_notice(&early, "#wetfish", "\u{1}ACTION waves\u{1}", NOW),
+            "Nudge: Alice spoke in #wetfish before the first reminder, so the reminders \
+             stopped: \"/me waves\""
+        );
+        assert_eq!(
+            nudge_over_notice(&nudge(1, 5)),
+            "Nudge: Alice's nudge is over, with no reply after 5 reminders. Over to you to \
+             review; nudge list has the rest."
+        );
+        assert_eq!(
+            nudge_over_notice(&nudge(1, 0)),
+            "Nudge: Alice's nudge is over without a reply. They weren't online for any of its \
+             5 reminders. Over to you to review; nudge list has the rest."
+        );
     }
 
     #[test]

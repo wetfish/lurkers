@@ -28,6 +28,15 @@ activity only gets the messages that need neither.
 In #FBI_watchlist, times and dates are in capitals to match the shouting.
 Nicks and channels keep their case, so highlights still work.
 
+## Nudge reminders
+
+The `[nudge]` section's `reminder` list is for the people on the
+[nudge list](commands.md#nudges), in one friendly voice whatever their room.
+Reminders only have two placeholders, `{nick}`, which every reminder needs
+so they are highlighted, and `{channel}`, the channel the reminder is sent
+in. Each nudge goes through the list in turn, so its reminders are all
+different until every one has been used.
+
 ## Units
 
 Times are in days, and `{grace}` in the largest of days, hours and minutes

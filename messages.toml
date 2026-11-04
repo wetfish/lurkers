@@ -1,7 +1,7 @@
 # What lurker says in its rooms. lurker is built with this file, so a change
 # here takes effect when lurker is rebuilt and deployed.
 #
-# Each room has three lists:
+# Each room has these lists:
 #
 # - ping: one is sent to each lurker about once a week. Each lurker hears
 #   every ping they have the data for before any one repeats.
@@ -11,6 +11,8 @@
 # - warning: sent once, in a private message, to say the lurker will be
 #   kicked to their room after their grace period.
 # - kick: the reason given when lurker kicks a lurker from a channel.
+#
+# The nudge reminders, at the end, are apart from the rooms.
 #
 # Placeholders in braces are filled in for the lurker. A message is only used
 # when everything it needs is recorded about them, so lurkers without notes
@@ -150,4 +152,19 @@ kick = [
     "YOU'RE COMING WITH ME. {room}. NOW.",
     "TIME'S UP, PAL. {room}, DOWNTOWN.",
     "BOOKED. PROCESSING IN {room}.",
+]
+
+# Nudge reminders, for the people on the nudge list, whatever their room or
+# whether they are a lurker at all. One reminder is sent in every channel
+# they are in, all in the same friendly voice. {nick} is their nick and
+# {channel} the channel the reminder is sent in. Each nudge goes through
+# them in turn, so its reminders are all different.
+[nudge]
+reminder = [
+    "{nick}: hey! Friendly reminder that Wetfish is a community of real people, and we'd love to hear from you. Say hi sometime!",
+    "{nick}: Wetfish isn't a place to lurk in the shadows, it's a place to hang out. Pull up a chair and tell us what you've been up to.",
+    "{nick}: everyone in {channel} is a real person who'd be happy to chat with you. Don't be a stranger!",
+    "{nick}: this is your friendly nudge! We're a community, not an audience, and it's better when everyone joins in.",
+    "{nick}: we've missed hearing from you. Wetfish runs on people showing up and talking, so jump in whenever you like.",
+    "{nick}: hi! Lurking is easy, but chatting is more fun. Come say something, even just hello.",
 ]

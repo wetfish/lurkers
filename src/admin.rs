@@ -1405,6 +1405,7 @@ mod tests {
             added_at: NOW,
             sent: 2,
             first_reminder_at: Some(NOW + DAY),
+            last_reminder_at: Some(NOW + DAY),
             spoke_at: Some(NOW + 3 * DAY),
             ended_at: Some(NOW + 3 * DAY),
             ended: Some(NudgeEnd::Spoke),

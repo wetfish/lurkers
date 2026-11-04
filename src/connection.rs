@@ -8,7 +8,9 @@
 //! then kicks from every channel and an invite to their room, with a sajoin
 //! there if they don't join on the invite. lurker kicks as a channel op
 //! rather than with SAKICK, since the Matrix bridge only removes a Matrix
-//! user from the matching room for a kick by a user.
+//! user from the matching room for a kick by a user. It also reminds the
+//! people on the nudge list to chat, in every channel they are in, and
+//! stays in those channels until their nudge ends to hear them answer.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -25,7 +27,7 @@ use crate::admin;
 use crate::casemap;
 use crate::config::{Room, Settings};
 use crate::dates;
-use crate::db::{Db, Lurker, NickChange};
+use crate::db::{Db, Lurker, NickChange, Nudge, NudgeEnd};
 use crate::http::Status;
 use crate::messages::{self, Facts, Kind, Messages};
 use crate::presence::Presence;
@@ -78,6 +80,11 @@ const INVITE_WAIT: std::ops::RangeInclusive<i64> = 30..=60;
 /// before inviting them back. The Matrix bridge is slow to pass on the kick,
 /// and withdraws an invite that reaches it before the kick does.
 const REINVITE_DELAY: i64 = 60;
+
+/// How long lurker waits before looking someone on the nudge list up again,
+/// when a reminder couldn't go out, such as because it sent another in one
+/// of their channels a moment ago.
+const NUDGE_RETRY: i64 = 5 * 60;
 
 /// How often to check for invites and sajoins that are due.
 const INVITE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -386,6 +393,13 @@ struct Session<'a> {
     /// Lurkers kicked from their room to be invited back, by id, with when
     /// lurker invites them
     reinvite: HashMap<i64, i64>,
+    /// When lurker last looked up each nudge's nick, by nudge id
+    nudge_checked: HashMap<i64, i64>,
+    /// When lurker last sent a nudge reminder in each channel, folded
+    nudge_posted: HashMap<String, i64>,
+    /// Channels lurker is in only for nudges, folded, with their names, so
+    /// it can leave them once no nudge needs them
+    nudge_joined: HashMap<String, String>,
 }
 
 impl<'a> Session<'a> {
@@ -412,6 +426,9 @@ impl<'a> Session<'a> {
             visiting: HashMap::new(),
             invited: HashMap::new(),
             reinvite: HashMap::new(),
+            nudge_checked: HashMap::new(),
+            nudge_posted: HashMap::new(),
+            nudge_joined: HashMap::new(),
         }
     }
 
@@ -466,6 +483,7 @@ impl<'a> Session<'a> {
             Command::Response(Response::RPL_ISON, args) => {
                 self.ison_reply(args.last().map_or("", String::as_str));
                 commands.extend(self.enforce(now));
+                commands.extend(self.look_up_nudged(now));
             }
             Command::Response(Response::RPL_WHOISUSER, args) => {
                 if let Some(nick) = args.get(1)
@@ -497,6 +515,10 @@ impl<'a> Session<'a> {
                 for channel in channels.split(',') {
                     if self.is_me(source) {
                         self.joined.insert(casemap::fold(channel));
+                        if self.is_nudge_channel(channel) && !self.is_wanted(channel) {
+                            self.nudge_joined
+                                .insert(casemap::fold(channel), channel.to_owned());
+                        }
                         eprintln!("Joined {channel}");
                         continue;
                     }
@@ -596,13 +618,17 @@ impl<'a> Session<'a> {
     }
 
     /// What lurker does every minute: sends pings that are due, gives itself
-    /// +o where it lost it, asks which lurkers are online, and warns and
-    /// kicks those that are due.
+    /// +o where it lost it, asks which lurkers and nudged people are online,
+    /// warns and kicks the lurkers that are due, ends the nudges whose time
+    /// is up, and leaves the channels no nudge needs any more.
     fn tick(&mut self, now: i64) -> Vec<Command> {
         let mut commands = self.ping_due(now);
         commands.extend(self.op_myself(now));
         commands.extend(self.check_online(now));
         commands.extend(self.enforce(now));
+        commands.extend(self.end_nudges(now));
+        commands.extend(self.look_up_nudged(now));
+        commands.extend(self.leave_nudge_channels());
         commands
     }
 
@@ -613,11 +639,22 @@ impl<'a> Session<'a> {
             return Vec::new();
         }
 
-        self.wanted()
+        let mut commands: Vec<Command> = self
+            .wanted()
             .into_iter()
             .filter(|channel| !self.joined.contains(&casemap::fold(channel)))
             .map(|channel| Command::JOIN(channel, None, None))
-            .collect()
+            .collect();
+        // The channels it stays in for nudges, which it may not be allowed
+        // to join any other way
+        if self.opered {
+            for channel in log_db(self.db.nudge_channels()).unwrap_or_default() {
+                if !self.joined.contains(&casemap::fold(&channel)) && !self.is_wanted(&channel) {
+                    commands.push(Command::SAJOIN(self.nick.clone(), channel));
+                }
+            }
+        }
+        commands
     }
 
     /// Reads the settings file again if it changed, and logs what happened.
@@ -678,7 +715,8 @@ impl<'a> Session<'a> {
     /// command's name gives a command, answered in the channel. Anything
     /// else after lurker's nick is ordinary chat and gets no reply. A
     /// message may also be a lurker speaking, which stops their kicks, and
-    /// in their room plays the fanfare.
+    /// in their room plays the fanfare, or someone being nudged speaking,
+    /// which ends their nudge.
     fn channel_message(
         &mut self,
         message: &Message,
@@ -703,11 +741,11 @@ impl<'a> Session<'a> {
         }
 
         let source = message.source_nickname().unwrap_or("");
-        self.heard(channel, source, now);
-        match self.room_of(channel) {
-            Some(room) => self.spoke(room, source, text, now),
-            None => Vec::new(),
+        let mut commands = self.heard(channel, source, text, now);
+        if let Some(room) = self.room_of(channel) {
+            commands.extend(self.spoke(room, source, text, now));
         }
+        commands
     }
 
     /// The text after lurker's nick, when a message starts with it, as in
@@ -986,8 +1024,9 @@ impl<'a> Session<'a> {
         self.enforceable(lurker) && lurker.kick_at().is_none_or(|at| at <= now)
     }
 
-    /// ISON for the lurkers lurker needs to know are online, as an IRC
-    /// operator. The replies come back in the same order.
+    /// ISON for the lurkers lurker needs to know are online, and the people
+    /// being nudged who have a reminder due, as an IRC operator. The
+    /// replies come back in the same order.
     fn check_online(&mut self, now: i64) -> Vec<Command> {
         if !self.opered {
             return Vec::new();
@@ -995,21 +1034,30 @@ impl<'a> Session<'a> {
         let Some(lurkers) = log_db(self.db.lurkers()) else {
             return Vec::new();
         };
+        let mut nicks: Vec<String> = lurkers
+            .iter()
+            .filter(|lurker| self.wanted_online(lurker, now))
+            .map(|lurker| lurker.nick.clone())
+            .collect();
+        nicks.extend(
+            log_db(self.db.going_nudges())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|nudge| nudge.reminder_due(now))
+                .map(|nudge| nudge.nick),
+        );
 
         let mut batches: Vec<Vec<String>> = Vec::new();
         let mut length = 0;
-        for lurker in lurkers
-            .iter()
-            .filter(|lurker| self.wanted_online(lurker, now))
-        {
-            if batches.is_empty() || length + lurker.nick.len() >= ISON_LENGTH {
+        for nick in nicks {
+            if batches.is_empty() || length + nick.len() >= ISON_LENGTH {
                 batches.push(Vec::new());
                 length = 0;
             }
+            length += nick.len() + 1;
             if let Some(batch) = batches.last_mut() {
-                batch.push(lurker.nick.clone());
+                batch.push(nick);
             }
-            length += lurker.nick.len() + 1;
         }
 
         self.ison.extend(batches.iter().cloned());
@@ -1132,12 +1180,158 @@ impl<'a> Session<'a> {
             return Vec::new();
         }
         let Some(lurker) = log_db(self.db.lurker(nick)).flatten() else {
-            return Vec::new();
+            return match log_db(self.db.nudge(nick)).flatten() {
+                Some(nudge) => self.remind(&nudge, &lookup.channels, now),
+                None => Vec::new(),
+            };
         };
         if !self.enforceable(&lurker) || lurker.kick_at().is_none_or(|at| at > now) {
             return Vec::new();
         }
         self.sweep(&lurker, &lookup.channels, now)
+    }
+
+    /// WHOIS for the people being nudged who have a reminder due and are
+    /// online, to find every channel they are in, as an IRC operator.
+    fn look_up_nudged(&mut self, now: i64) -> Vec<Command> {
+        if !self.opered {
+            return Vec::new();
+        }
+        let mut commands = Vec::new();
+        for nudge in log_db(self.db.going_nudges()).unwrap_or_default() {
+            let key = casemap::fold(&nudge.nick);
+            let recent = self
+                .nudge_checked
+                .get(&nudge.id)
+                .is_some_and(|&at| now - at < NUDGE_RETRY);
+            if !nudge.reminder_due(now)
+                || recent
+                || self.lookups.contains_key(&key)
+                || !self.is_online(&nudge.nick)
+                || self.is_own_nick(&nudge.nick)
+            {
+                continue;
+            }
+            self.nudge_checked.insert(nudge.id, now);
+            self.lookups.insert(key, Lookup::default());
+            commands.push(Command::WHOIS(None, nudge.nick.clone()));
+        }
+        commands
+    }
+
+    /// Sends a nudge's reminder in every channel they are in, sajoining
+    /// itself into those it isn't in, where it stays until the nudge ends.
+    /// The reminder waits when lurker sent another nudge's reminder in one
+    /// of their channels within the last 20 minutes, so a channel is never
+    /// flooded.
+    fn remind(&mut self, nudge: &Nudge, channels: &[String], now: i64) -> Vec<Command> {
+        if !self.opered || !nudge.reminder_due(now) {
+            return Vec::new();
+        }
+        if channels.is_empty() {
+            eprintln!(
+                "{} is online but in no channels to remind them in",
+                nudge.nick
+            );
+            return Vec::new();
+        }
+        let busy = channels.iter().find(|channel| {
+            self.nudge_posted
+                .get(&casemap::fold(channel))
+                .is_some_and(|&at| now - at < schedule::ROOM_GAP)
+        });
+        if let Some(channel) = busy {
+            eprintln!(
+                "Reminding {} later, since {channel} had a nudge reminder a moment ago",
+                nudge.nick
+            );
+            return Vec::new();
+        }
+
+        let mut commands = Vec::new();
+        for channel in channels {
+            let key = casemap::fold(channel);
+            log_db(self.db.add_nudge_channel(nudge.id, channel));
+            let inside = self.joined.contains(&key) && !self.visiting.contains_key(&key);
+            if !inside {
+                commands.push(Command::SAJOIN(self.nick.clone(), channel.clone()));
+            }
+            let text = self.messages.reminder(nudge, channel);
+            commands.push(Command::PRIVMSG(channel.clone(), text));
+            self.nudge_posted.insert(key, now);
+        }
+        log_db(self.db.set_reminded(nudge.id, now));
+        eprintln!(
+            "Reminded {} to chat in {}: reminder {} of {}",
+            nudge.nick,
+            channels.join(", "),
+            nudge.sent + 1,
+            nudge.reminders
+        );
+        commands
+    }
+
+    /// Ends the nudges whose time is up, and tells the admins, for them to
+    /// review.
+    fn end_nudges(&mut self, now: i64) -> Vec<Command> {
+        let mut commands = Vec::new();
+        for nudge in log_db(self.db.going_nudges()).unwrap_or_default() {
+            if now < nudge.ends_at() {
+                continue;
+            }
+            if log_db(
+                self.db
+                    .end_nudge(&nudge.nick, NudgeEnd::Finished, None, now),
+            )
+            .flatten()
+            .is_none()
+            {
+                continue;
+            }
+            self.nudge_checked.remove(&nudge.id);
+            eprintln!(
+                "{}'s nudge is over, after {} of {} reminders",
+                nudge.nick, nudge.sent, nudge.reminders
+            );
+            commands.extend(self.tell_admins(&messages::nudge_over_notice(&nudge)));
+        }
+        commands
+    }
+
+    /// Leaves the channels lurker was in only for nudges that have ended.
+    fn leave_nudge_channels(&mut self) -> Vec<Command> {
+        let needed: HashSet<String> = log_db(self.db.nudge_channels())
+            .unwrap_or_default()
+            .iter()
+            .chain(self.wanted().iter())
+            .map(|channel| casemap::fold(channel))
+            .collect();
+        let done: Vec<(String, String)> = self
+            .nudge_joined
+            .iter()
+            .filter(|(key, _)| !needed.contains(*key))
+            .map(|(key, name)| (key.clone(), name.clone()))
+            .collect();
+
+        let mut commands = Vec::new();
+        for (key, channel) in done {
+            self.nudge_joined.remove(&key);
+            if self.joined.contains(&key) {
+                eprintln!("Leaving {channel}, since no nudge needs it any more");
+                commands.push(Command::PART(channel, None));
+            }
+        }
+        commands
+    }
+
+    /// A private message to every admin.
+    fn tell_admins(&self, text: &str) -> Vec<Command> {
+        self.settings
+            .config
+            .admins
+            .iter()
+            .map(|admin| Command::PRIVMSG(admin.nick.clone(), text.to_owned()))
+            .collect()
     }
 
     /// Kicks a lurker from every channel but their room, and invites them
@@ -1303,10 +1497,7 @@ impl<'a> Session<'a> {
         }
 
         let me = self.nick.clone();
-        let own = self
-            .wanted()
-            .iter()
-            .any(|wanted| casemap::eq(wanted, channel));
+        let own = self.is_wanted(channel) || self.is_nudge_channel(channel);
         let mut commands = Vec::new();
         if !inside {
             commands.push(Command::SAJOIN(me.clone(), channel.to_owned()));
@@ -1341,16 +1532,27 @@ impl<'a> Session<'a> {
     }
 
     /// Someone said something in one of lurker's channels. A lurker who
-    /// speaks after their warning is no longer kicked.
-    fn heard(&mut self, channel: &str, nick: &str, now: i64) {
-        let Some(lurker) = log_db(self.db.lurker(nick)).flatten() else {
-            return;
-        };
-        log_db(self.db.set_spoke(lurker.id, now));
-        if lurker.warned_at.is_some() && !lurker.released() {
-            self.swept.remove(&lurker.id);
-            eprintln!("Lurker {nick} spoke in {channel}, so they won't be kicked any more");
+    /// speaks after their warning is no longer kicked. Someone being nudged
+    /// who speaks ends their nudge, and the admins are told.
+    fn heard(&mut self, channel: &str, nick: &str, text: &str, now: i64) -> Vec<Command> {
+        if let Some(lurker) = log_db(self.db.lurker(nick)).flatten() {
+            log_db(self.db.set_spoke(lurker.id, now));
+            if lurker.warned_at.is_some() && !lurker.released() {
+                self.swept.remove(&lurker.id);
+                eprintln!("Lurker {nick} spoke in {channel}, so they won't be kicked any more");
+            }
+            return Vec::new();
         }
+
+        let Some(nudge) = log_db(self.db.nudge_spoke(nick, now)).flatten() else {
+            return Vec::new();
+        };
+        self.nudge_checked.remove(&nudge.id);
+        eprintln!(
+            "{nick} spoke in {channel} after {} of {} nudge reminders, so their nudge ended",
+            nudge.sent, nudge.reminders
+        );
+        self.tell_admins(&messages::nudge_spoke_notice(&nudge, channel, text, now))
     }
 
     /// Gives lurker +o, with SAMODE as an IRC operator, in each of its
@@ -1550,6 +1752,7 @@ impl<'a> Session<'a> {
             }
         }
         self.joined.remove(&key);
+        self.nudge_joined.remove(&key);
         self.status.remove(&key);
         self.presence.clear(channel);
     }
@@ -1582,6 +1785,22 @@ impl<'a> Session<'a> {
             self.settings.config.rooms.all().map(str::to_owned).to_vec();
         channels.extend(log_db(self.db.channels()).unwrap_or_default());
         channels
+    }
+
+    /// Whether a channel is one of lurker's rooms or the channels admins
+    /// asked it to join.
+    fn is_wanted(&self, channel: &str) -> bool {
+        self.wanted()
+            .iter()
+            .any(|wanted| casemap::eq(wanted, channel))
+    }
+
+    /// Whether lurker stays in a channel for a nudge that is going.
+    fn is_nudge_channel(&self, channel: &str) -> bool {
+        log_db(self.db.nudge_channels())
+            .unwrap_or_default()
+            .iter()
+            .any(|nudged| casemap::eq(nudged, channel))
     }
 
     /// The channels admins asked lurker to join, other than its rooms, that
@@ -1773,6 +1992,7 @@ mod tests {
                 }
                 Command::PART(channel, None) => format!("PART {channel}"),
                 Command::INVITE(nick, channel) => format!("INVITE {nick} {channel}"),
+                Command::PRIVMSG(target, _) => format!("PRIVMSG {target}"),
                 other => format!("{other:?}"),
             })
             .collect()
@@ -2908,6 +3128,133 @@ mod tests {
             session.channels_report(),
             "My channels: #wetfish (opped). I'm logged in as an IRC operator, so I warn and \
              kick lurkers."
+        );
+    }
+
+    #[test]
+    fn reminds_nudged_people_everywhere_until_they_speak() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let mut session = opered(&mut settings, &db);
+        in_wetfish(&mut session, &db, "@", "");
+        db.add_nudge("alice", 3 * DAY, 3, "rachel", 1000).unwrap();
+
+        assert_eq!(
+            session.tick(1000),
+            [Command::ISON(vec!["alice".to_owned()])]
+        );
+        let sent = feed_at(&mut session, 1000, &[":irc.example.net 303 lurker :alice"]);
+        assert_eq!(sent, [whois("alice")]);
+        let sent = feed_at(
+            &mut session,
+            1000,
+            &[
+                ":irc.example.net 311 lurker alice ~a host * :Alice",
+                ":irc.example.net 319 lurker alice :#wetfish @#anime",
+                ":irc.example.net 318 lurker alice :End of /WHOIS list.",
+            ],
+        );
+        assert_eq!(
+            shapes(&sent),
+            ["PRIVMSG #wetfish", "SAJOIN lurker #anime", "PRIVMSG #anime"]
+        );
+        for command in &sent {
+            if let Command::PRIVMSG(_, text) = command {
+                assert!(text.starts_with("alice: "), "{text}");
+            }
+        }
+        let alice = db.nudge("alice").unwrap().unwrap();
+        assert_eq!((alice.sent, alice.first_reminder_at), (1, Some(1000)));
+        assert_eq!(db.nudge_channels().unwrap(), ["#anime", "#wetfish"]);
+
+        // Nothing more until the next reminder is due, a day later
+        assert!(session.tick(1000 + HOUR).is_empty());
+
+        // lurker stays in #anime, and hears alice answer there
+        feed(&mut session, &[":lurker!lurker@host JOIN #anime"]);
+        assert!(session.nudge_joined.contains_key("#anime"));
+        let sent = feed_at(
+            &mut session,
+            1000 + 2 * HOUR,
+            &[":alice!~a@h PRIVMSG #anime :oh hi"],
+        );
+        let [notice] = sent.as_slice() else {
+            panic!("expected a notice, got {sent:?}");
+        };
+        assert_eq!(
+            said(notice),
+            (
+                "rachel",
+                "Nudge: alice spoke in #anime 2 hours after the first reminder, with 1 of 3 \
+                 reminders sent, so the reminders stopped: \"oh hi\""
+            )
+        );
+        assert_eq!(db.nudge("alice").unwrap(), None);
+
+        // Then leaves #anime, but not #wetfish, which an admin asked for
+        assert_eq!(
+            session.tick(1000 + 2 * HOUR),
+            [Command::PART("#anime".to_owned(), None)]
+        );
+    }
+
+    #[test]
+    fn waits_to_remind_in_a_channel_just_reminded() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let mut session = opered(&mut settings, &db);
+        in_wetfish(&mut session, &db, "@", "");
+        db.add_nudge("alice", 3 * DAY, 3, "rachel", 1000).unwrap();
+        db.add_nudge("carol", 3 * DAY, 3, "rachel", 1000).unwrap();
+        let alice = db.nudge("alice").unwrap().unwrap();
+        let carol = db.nudge("carol").unwrap().unwrap();
+        let channels = ["#wetfish".to_owned()];
+
+        assert_eq!(
+            shapes(&session.remind(&alice, &channels, 1000)),
+            ["PRIVMSG #wetfish"]
+        );
+        assert!(session.remind(&carol, &channels, 1060).is_empty());
+        assert_eq!(db.nudge("carol").unwrap().unwrap().sent, 0);
+        assert_eq!(
+            shapes(&session.remind(&carol, &channels, 1000 + schedule::ROOM_GAP)),
+            ["PRIVMSG #wetfish"]
+        );
+    }
+
+    #[test]
+    fn tells_admins_when_a_nudge_is_over() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let mut session = opered(&mut settings, &db);
+        db.add_nudge("bob", 2 * HOUR, 2, "rachel", 0).unwrap();
+
+        assert!(session.end_nudges(2 * HOUR - 1).is_empty());
+        assert_eq!(
+            session.end_nudges(2 * HOUR),
+            [Command::PRIVMSG(
+                "rachel".to_owned(),
+                "Nudge: bob's nudge is over without a reply. They weren't online for any of its \
+                 2 reminders. Over to you to review; nudge list has the rest."
+                    .to_owned()
+            )]
+        );
+        assert!(session.end_nudges(3 * HOUR).is_empty());
+        assert_eq!(db.nudges().unwrap()[0].ended, Some(NudgeEnd::Finished));
+    }
+
+    #[test]
+    fn rejoins_nudge_channels_after_a_restart() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        db.add_nudge("alice", 3 * DAY, 3, "rachel", 0).unwrap();
+        let id = db.nudge("alice").unwrap().unwrap().id;
+        db.add_nudge_channel(id, "#anime").unwrap();
+
+        let session = opered(&mut settings, &db);
+        assert_eq!(
+            session.rejoin(),
+            [Command::SAJOIN("lurker".to_owned(), "#anime".to_owned())]
         );
     }
 

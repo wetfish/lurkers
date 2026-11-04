@@ -85,6 +85,7 @@ nudge remove user=alice
 `nudge list` shows the nudges going, with how many reminders have been sent,
 and the 20 that ended most recently, with how each went: whether they spoke
 and how long after the first reminder, or why the nudge ended.
+[How lurker works](how-it-works.md#nudges) explains the reminders.
 
 ## Channels
 

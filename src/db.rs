@@ -4,7 +4,9 @@
 //! `lurkers` has one row per marked user. `used_pings` remembers which ping
 //! messages each lurker has heard, and `channels` the channels admins asked
 //! lurker to join besides its rooms. `nudges` is the nudge list: the people
-//! admins asked lurker to remind to chat, kept after each nudge ends. Nobody else is recorded: people who
+//! admins asked lurker to remind to chat, kept after each nudge ends.
+//! `nudge_channels` has the channels lurker reminded each of them in, and
+//! stays in while their nudge is going. Nobody else is recorded: people who
 //! aren't marked are left alone.
 //!
 //! Times are whole seconds since 1970 UTC. In `sqlite3`,
@@ -22,8 +24,9 @@ use crate::config::Room;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 8] = [
+const MIGRATIONS: [&str; 9] = [
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+    SCHEMA_V9,
 ];
 
 const SCHEMA_V1: &str = "
@@ -156,6 +159,20 @@ CREATE TABLE nudges (
 CREATE UNIQUE INDEX nudges_going ON nudges (nick_key) WHERE ended_at IS NULL;
 ";
 
+const SCHEMA_V9: &str = "
+-- The channels lurker sent a nudge's reminders in. lurker stays in them
+-- while the nudge is going, to hear them answer, and forgets them when it
+-- ends.
+CREATE TABLE nudge_channels (
+    nudge_id INTEGER NOT NULL REFERENCES nudges (id) ON DELETE CASCADE,
+    -- The channel name folded with IRC's case mapping.
+    channel_key TEXT NOT NULL,
+    -- The channel name as the server gave it.
+    channel TEXT NOT NULL,
+    PRIMARY KEY (nudge_id, channel_key)
+);
+";
+
 /// How often a lurker chatted in the year they were most active.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Frequency {
@@ -251,6 +268,7 @@ pub struct Nudge {
     /// How many reminders lurker has sent
     pub sent: i64,
     pub first_reminder_at: Option<i64>,
+    pub last_reminder_at: Option<i64>,
     /// When lurker first heard them speak after a reminder
     pub spoke_at: Option<i64>,
     pub ended_at: Option<i64>,
@@ -263,6 +281,28 @@ impl Nudge {
     /// When the nudge is over.
     pub fn ends_at(&self) -> i64 {
         self.added_at + self.length
+    }
+
+    /// The time between reminders, with the reminders spread evenly over
+    /// the nudge.
+    pub fn gap(&self) -> i64 {
+        self.length / self.reminders.max(1)
+    }
+
+    /// Whether a reminder is due: the nudge is going, it has reminders
+    /// left, the next one's time has come, and the last one was a whole gap
+    /// ago, so reminders missed while they were offline don't come in a
+    /// burst.
+    pub fn reminder_due(&self, now: i64) -> bool {
+        let scheduled = self.added_at + self.sent * self.gap();
+        let spaced = self
+            .last_reminder_at
+            .is_none_or(|last| now - last >= self.gap());
+        self.ended_at.is_none()
+            && self.sent < self.reminders
+            && now >= scheduled
+            && now < self.ends_at()
+            && spaced
     }
 }
 
@@ -304,7 +344,7 @@ impl NudgeEnd {
 
 /// The columns `load_nudge` reads, in order.
 const NUDGE_COLUMNS: &str = "id, nick, length, reminders, added_by, added_at, sent, \
-    first_reminder_at, spoke_at, ended_at, ended, ended_by";
+    first_reminder_at, last_reminder_at, spoke_at, ended_at, ended, ended_by";
 
 /// What marking someone changed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -638,8 +678,62 @@ impl Db {
         Ok(true)
     }
 
+    /// The nudges going, by nick.
+    pub fn going_nudges(&self) -> rusqlite::Result<Vec<Nudge>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {NUDGE_COLUMNS} FROM nudges WHERE ended_at IS NULL ORDER BY nick_key"
+        ))?;
+        statement.query_map([], load_nudge)?.collect()
+    }
+
+    /// Records that lurker sent one of a nudge's reminders.
+    pub fn set_reminded(&self, id: i64, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE nudges
+             SET sent = sent + 1, first_reminder_at = coalesce(first_reminder_at, ?2),
+                 last_reminder_at = ?2
+             WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Records a channel lurker sent a nudge's reminder in.
+    pub fn add_nudge_channel(&self, id: i64, channel: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO nudge_channels (nudge_id, channel_key, channel)
+             VALUES (?1, ?2, ?3)",
+            params![id, casemap::fold(channel), channel],
+        )?;
+        Ok(())
+    }
+
+    /// The channels lurker stays in for the nudges going, by name.
+    pub fn nudge_channels(&self) -> rusqlite::Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT min(channel) FROM nudge_channels
+             JOIN nudges ON nudges.id = nudge_channels.nudge_id
+             WHERE nudges.ended_at IS NULL
+             GROUP BY channel_key ORDER BY channel_key",
+        )?;
+        statement.query_map([], |row| row.get(0))?.collect()
+    }
+
+    /// Ends the nudge going for a nick because they spoke, and returns it
+    /// as it was, or None when there was none.
+    pub fn nudge_spoke(&self, nick: &str, now: i64) -> rusqlite::Result<Option<Nudge>> {
+        let Some(nudge) = self.nudge(nick)? else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "UPDATE nudges SET spoke_at = ?2 WHERE id = ?1",
+            params![nudge.id, now],
+        )?;
+        self.end_nudge(nick, NudgeEnd::Spoke, None, now)
+    }
+
     /// Ends the nudge going for a nick, and returns it as it was, or None
-    /// when there was none.
+    /// when there was none. lurker no longer stays in its channels.
     pub fn end_nudge(
         &self,
         nick: &str,
@@ -654,6 +748,8 @@ impl Db {
             "UPDATE nudges SET ended_at = ?2, ended = ?3, ended_by = ?4 WHERE id = ?1",
             params![nudge.id, now, end.as_str(), admin],
         )?;
+        self.conn
+            .execute("DELETE FROM nudge_channels WHERE nudge_id = ?1", [nudge.id])?;
         Ok(Some(nudge))
     }
 
@@ -722,7 +818,7 @@ impl Db {
 
 /// A nudge from a row with `NUDGE_COLUMNS`.
 fn load_nudge(row: &rusqlite::Row) -> rusqlite::Result<Nudge> {
-    let ended: Option<String> = row.get(10)?;
+    let ended: Option<String> = row.get(11)?;
     Ok(Nudge {
         id: row.get(0)?,
         nick: row.get(1)?,
@@ -732,11 +828,12 @@ fn load_nudge(row: &rusqlite::Row) -> rusqlite::Result<Nudge> {
         added_at: row.get(5)?,
         sent: row.get(6)?,
         first_reminder_at: row.get(7)?,
-        spoke_at: row.get(8)?,
-        ended_at: row.get(9)?,
+        last_reminder_at: row.get(8)?,
+        spoke_at: row.get(9)?,
+        ended_at: row.get(10)?,
         // The schema only allows the four reasons
         ended: ended.as_deref().and_then(NudgeEnd::parse),
-        ended_by: row.get(11)?,
+        ended_by: row.get(12)?,
     })
 }
 
@@ -924,6 +1021,61 @@ mod tests {
             (old.ended_at, old.ended_by.as_deref()),
             (Some(300), Some("sam"))
         );
+    }
+
+    #[test]
+    fn spreads_reminders_over_the_nudge() {
+        let db = Db::open_in_memory();
+        // 3 reminders over 3,000 seconds, from 100: due at 100, 1100 and 2100
+        db.add_nudge("alice", 3000, 3, "rachel", 100).unwrap();
+        let nudge = || db.nudge("alice").unwrap().unwrap();
+        assert!(!nudge().reminder_due(99));
+        assert!(nudge().reminder_due(100));
+
+        db.set_reminded(nudge().id, 100).unwrap();
+        assert_eq!(
+            (
+                nudge().sent,
+                nudge().first_reminder_at,
+                nudge().last_reminder_at
+            ),
+            (1, Some(100), Some(100))
+        );
+        assert!(!nudge().reminder_due(1099));
+        assert!(nudge().reminder_due(1100));
+
+        // Offline for a while: the second comes late, and the third a whole
+        // gap after it rather than straight away
+        db.set_reminded(nudge().id, 2050).unwrap();
+        assert_eq!(nudge().first_reminder_at, Some(100));
+        assert!(!nudge().reminder_due(2100));
+        assert!(nudge().reminder_due(3050));
+        assert!(!nudge().reminder_due(3100), "the nudge is over");
+    }
+
+    #[test]
+    fn remembers_nudge_channels_while_the_nudge_goes() {
+        let db = Db::open_in_memory();
+        db.add_nudge("alice", 3000, 3, "rachel", 100).unwrap();
+        db.add_nudge("bob", 3000, 3, "rachel", 100).unwrap();
+        let alice = db.nudge("alice").unwrap().unwrap().id;
+        let bob = db.nudge("bob").unwrap().unwrap().id;
+        db.add_nudge_channel(alice, "#Anime").unwrap();
+        db.add_nudge_channel(alice, "#anime").unwrap();
+        db.add_nudge_channel(bob, "#anime").unwrap();
+        db.add_nudge_channel(bob, "#music").unwrap();
+        assert_eq!(db.nudge_channels().unwrap(), ["#Anime", "#music"]);
+
+        let spoke = db.nudge_spoke("bob", 500).unwrap().unwrap();
+        assert_eq!(spoke.id, bob);
+        assert_eq!(db.nudge_channels().unwrap(), ["#Anime"]);
+        let ended = db.nudges().unwrap();
+        let bob = ended.iter().find(|nudge| nudge.nick == "bob").unwrap();
+        assert_eq!(
+            (bob.spoke_at, bob.ended),
+            (Some(500), Some(NudgeEnd::Spoke))
+        );
+        assert_eq!(db.nudge_spoke("bob", 600).unwrap(), None);
     }
 
     #[test]

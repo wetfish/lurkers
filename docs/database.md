@@ -63,6 +63,13 @@ at a time.
 | `ended` | Why it ended: `spoke`, `finished` when its time ran out, `removed` with `nudge remove`, or `marked` as a lurker |
 | `ended_by` | The admin who removed or marked them, for `removed` and `marked` |
 
+## nudge_channels
+
+The channels lurker sent each going nudge's reminders in, and stays in to
+hear them answer: `nudge_id`, `channel_key` (the name lowercased with IRC's
+case mapping) and `channel` (the name as the server gave it). A nudge's
+rows are deleted when it ends.
+
 ## channels
 
 The channels admins asked lurker to join besides its rooms: `channel_key`
