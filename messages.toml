@@ -5,7 +5,8 @@
 #
 # - ping: one is sent to each lurker about once a week. Each lurker hears
 #   every ping they have the data for before any one repeats.
-# - welcome: one is sent when a lurker first joins their room.
+# - welcome: one is sent when a lurker first joins their room, never the
+#   same one twice in a row in a room.
 # - fanfare: one is sent when a lurker speaks, at most once a day.
 # - warning: sent once, in a channel lurker can kick from, to say the lurker
 #   will be kicked to their room after their grace period.
@@ -52,6 +53,12 @@ welcome = [
     "{nick} has arrived in #purgatory. Pull up a cloud. Say something whenever you're ready and I'll make a big deal of it, I promise.",
     "Welcome, {nick}. We haven't heard from you in {idle}, so they sent you here. I'm sorry. I'll keep you company.",
     "{nick}! I'd hug you if I had arms. Welcome to #purgatory. Say anything at all and I'll tell the admins you're back.",
+    "{nick}, welcome to #purgatory. I know this isn't where you wanted to end up. I kept a light on for you anyway.",
+    "Hi {nick}. You probably have questions. Mostly the answer is: we missed you. Say anything and I'll stop being sad about it.",
+    "{nick} is here! It's so good to see your name again. Everyone in #purgatory is someone we haven't heard from in a while. You're in good company.",
+    "Welcome, {nick}. Nobody's in trouble. You just went quiet {idle} ago and we wanted you somewhere we could keep an eye on you.",
+    "Oh, {nick}. It's really you. Welcome to #purgatory. Sit wherever you like, all the seats are a little sad.",
+    "{nick}, welcome. This is where we keep the people we can't stop thinking about. You're one of them now. Sorry. Also, yay.",
 ]
 
 # Fanfare, when a lurker speaks
@@ -114,6 +121,12 @@ welcome = [
     "{nick}! WELCOME TO #FBI_watchlist. YOU HAVE THE RIGHT TO REMAIN SILENT. YOU'VE CLEARLY BEEN USING IT.",
     "NEW SUSPECT! {nick}, {lurking} OF LURKING AND NOT ONE WORD. YOU'RE GONNA LOVE IT HERE. NOBODY ELSE DOES.",
     "{nick}! EMPTY YOUR POCKETS. BELT AND SHOELACES TOO. YOU'RE GONNA BE HERE A WHILE.",
+    "{nick}. SIT. NO, NOT THERE. THERE. NOW WE WAIT UNTIL YOU FEEL LIKE TALKING.",
+    "BOOKING NUMBER 0451: {nick}. CHARGE: LOITERING WITH INTENT TO LURK. HOW DO YOU PLEAD?",
+    "{nick}! I'VE BEEN WAITING FOR YOU. GRAB A CHAIR. THE LIGHT STAYS ON.",
+    "LOOK WHO FINALLY SHOWED UP. {nick}, {lurking} IN OUR CHANNELS AND NOT ONE WORD. START TALKING.",
+    "{nick}! YOU'RE IN #FBI_watchlist NOW. EVERY WORD YOU DON'T SAY CAN AND WILL BE USED AGAINST YOU.",
+    "{nick}, THE CAMERAS ARE ON AND THE COFFEE IS COLD. WE CAN DO THIS THE EASY WAY OR THE HARD WAY. YOUR CALL.",
 ]
 
 # Fanfare, when a lurker speaks

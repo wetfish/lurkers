@@ -449,12 +449,12 @@ mod tests {
         let messages = Messages::builtin().unwrap();
         let count = |room, kind| messages.templates(room, kind).len();
         assert_eq!(count(Room::Purgatory, Kind::Ping), 22);
-        assert_eq!(count(Room::Purgatory, Kind::Welcome), 4);
+        assert_eq!(count(Room::Purgatory, Kind::Welcome), 10);
         assert_eq!(count(Room::Purgatory, Kind::Fanfare), 5);
         assert_eq!(count(Room::Purgatory, Kind::Warning), 3);
         assert_eq!(count(Room::Purgatory, Kind::Kick), 3);
         assert_eq!(count(Room::Watchlist, Kind::Ping), 23);
-        assert_eq!(count(Room::Watchlist, Kind::Welcome), 4);
+        assert_eq!(count(Room::Watchlist, Kind::Welcome), 10);
         assert_eq!(count(Room::Watchlist, Kind::Fanfare), 5);
         assert_eq!(count(Room::Watchlist, Kind::Warning), 3);
         assert_eq!(count(Room::Watchlist, Kind::Kick), 3);

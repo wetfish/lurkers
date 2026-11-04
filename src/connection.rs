@@ -335,6 +335,9 @@ struct Session<'a> {
     presence: Presence,
     /// When lurker last pinged someone in each room, to space pings out
     last_ping: HashMap<Room, i64>,
+    /// The welcome lurker last sent in each room, by its number in
+    /// messages.toml, so the next one is different
+    last_welcome: HashMap<Room, usize>,
     /// Folded nicks of lurkers the server last said were online
     online: HashSet<String>,
     /// The nicks in each ISON sent, oldest first, to match the replies to
@@ -361,6 +364,7 @@ impl<'a> Session<'a> {
             op_asked: HashMap::new(),
             presence: Presence::default(),
             last_ping: HashMap::new(),
+            last_welcome: HashMap::new(),
             online: HashSet::new(),
             ison: VecDeque::new(),
             lookups: HashMap::new(),
@@ -1317,9 +1321,12 @@ impl<'a> Session<'a> {
             room: &channel,
             now,
         };
-        let (_, welcome) = self
+        // Never the same welcome twice in a row in a room
+        let last: Vec<usize> = self.last_welcome.get(&room).copied().into_iter().collect();
+        let (index, welcome) = self
             .messages
-            .choose(Kind::Welcome, &facts, &mut self.rng, &[])?;
+            .choose(Kind::Welcome, &facts, &mut self.rng, &last)?;
+        self.last_welcome.insert(room, index);
         eprintln!("Welcomed {nick} to {channel}");
         Some(Command::PRIVMSG(channel, welcome))
     }
@@ -1829,6 +1836,24 @@ mod tests {
             ],
         );
         assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    #[test]
+    fn never_sends_the_same_welcome_twice_in_a_row() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+
+        let mut previous = None;
+        for n in 0..30 {
+            let nick = format!("user{n}");
+            mark(&db, &nick, Room::Purgatory, None);
+            let sent = feed(&mut session, &[&format!(":{nick}!~l@h JOIN #purgatory")]);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            let index = session.last_welcome[&Room::Purgatory];
+            assert_ne!(Some(index), previous, "welcome {index} twice in a row");
+            previous = Some(index);
+        }
     }
 
     #[test]

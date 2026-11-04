@@ -40,9 +40,9 @@ admin who is online.
 lurker talks to lurkers in their own room only:
 
 - **Welcome:** the first time a lurker joins their room after being marked,
-  lurker welcomes them, to explain where they are. A lurker who was already
-  there isn't welcomed. Their time in the room starts when lurker first sees
-  them in it.
+  lurker welcomes them, to explain where they are, never with the same
+  welcome as the lurker before them. A lurker who was already there isn't
+  welcomed. Their time in the room starts when lurker first sees them in it.
 - **Pings:** about once a week, each lurker gets a ping. The first comes 3 to
   7 days after they join their room, or within a week for someone who was
   already there, and the rest 7 to 9 days apart. A lurker who isn't in the
