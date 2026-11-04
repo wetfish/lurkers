@@ -19,6 +19,7 @@ pub struct Config {
     pub database: Database,
     #[serde(default)]
     pub http: Http,
+    pub oper: Option<Oper>,
     #[serde(default)]
     pub admins: Vec<Admin>,
 }
@@ -67,6 +68,24 @@ pub struct Http {
     /// The address and port to serve it on, such as `0.0.0.0:8080`. No page
     /// is served without one.
     pub listen: Option<String>,
+}
+
+/// lurker's IRC operator login, which lets it op itself, kick lurkers from
+/// every channel and sajoin them into their room.
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Oper {
+    pub name: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Oper {
+    /// Leaves the password out, so it never reaches a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Oper")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Someone who may give lurker commands.
@@ -210,6 +229,13 @@ impl Config {
 
         if self.database.path.as_os_str().is_empty() {
             return Err("database.path must not be empty".to_owned());
+        }
+
+        if let Some(oper) = &self.oper {
+            check_name("oper.name", &oper.name)?;
+            if oper.password.is_empty() || oper.password.contains(['\r', '\n', '\0']) {
+                return Err("oper.password must be one line of text".to_owned());
+            }
         }
 
         if let Some(listen) = &self.http.listen
@@ -370,10 +396,11 @@ impl Settings {
             || new.rooms != self.config.rooms
             || new.database != self.config.database
             || new.http != self.config.http
+            || new.oper != self.config.oper
         {
             summary.push_str(
-                ". Changes to [irc], [rooms], [database] and [http] take effect when lurker \
-                 restarts",
+                ". Changes to [irc], [rooms], [database], [http] and [oper] take effect when \
+                 lurker restarts",
             );
         }
 
@@ -415,6 +442,27 @@ mod tests {
         assert_eq!(config.database.path, PathBuf::from("lurker.sqlite"));
         assert!(config.admins.is_empty());
         assert_eq!(config.http.listen, None);
+        assert!(config.oper.is_none());
+    }
+
+    #[test]
+    fn reads_the_oper_login_without_showing_the_password() {
+        let text = format!("{MINIMAL}[oper]\nname = \"lurker\"\npassword = \"hunter2 x\"\n");
+        let config = Config::parse(&text).unwrap();
+        let oper = config.oper.unwrap();
+        assert_eq!(
+            (oper.name.as_str(), oper.password.as_str()),
+            ("lurker", "hunter2 x")
+        );
+        assert!(!format!("{oper:?}").contains("hunter2"));
+
+        for (name, password) in [("", "x"), ("lurk er", "x"), ("lurker", "")] {
+            let text = format!("{MINIMAL}[oper]\nname = \"{name}\"\npassword = \"{password}\"\n");
+            assert!(
+                Config::parse(&text).is_err(),
+                "accepted {name:?} {password:?}"
+            );
+        }
     }
 
     #[test]

@@ -15,8 +15,11 @@ branch whenever it is pushed.
   to IRC, and shows nothing about anyone in its rooms or channels. `/up`
   answers 200 while lurker is connected and 503 while it isn't; the
   container's health check asks it with `lurker --health`, so a deploy only
-  succeeds once lurker is on IRC. The same domain takes the GitHub webhook
-  that deploys lurker.
+  succeeds once lurker is on IRC.
+- **The deploy webhook**, at `https://<server hostname>/hooks/lurker` on
+  the server's own hostname (`SERVER_HOSTNAME` in the server's `.env`), not
+  on `lurkers.wetfish.net`. The server only answers `/hooks/` on its own
+  hostname; every other domain goes straight to its project.
 - **The `data` volume**, Docker's `lurker_data`, at `/data` in the
   container, with the database.
 - **The settings**, `config/lurker/settings/lurker.toml` on the server,
@@ -58,6 +61,19 @@ The commands run as root on the server, in `/srv/wetfish-server`.
    listen = "0.0.0.0:8080"
    ```
 
+   And lurker's IRC operator login, from its oper block on the IRC server
+   (see "IRC operator" in the README), without which it warns and kicks
+   nobody:
+
+   ```toml
+   [oper]
+   name = "lurker"
+   password = "the plain password"
+   ```
+
+   The file is readable only by root, and stays out of the repository and
+   the image.
+
 4. Add the project:
 
    ```bash
@@ -65,8 +81,9 @@ The commands run as root on the server, in `/srv/wetfish-server`.
        --domain lurkers.wetfish.net --branch main --upstream lurker:8080
    ```
 
-   It builds lurker, starts it, waits for it to connect to IRC, and prints
-   the webhook to add in GitHub, under the repository's Settings → Webhooks.
+   It builds lurker, starts it, and waits for it to connect to IRC. The
+   first build compiles every dependency, which can take several minutes on
+   a small server. At the end it prints the webhook to add in GitHub.
 
 5. Check that `https://lurkers.wetfish.net/` says lurker is connected to
    IRC, and follow what lurker does:
@@ -74,6 +91,22 @@ The commands run as root on the server, in `/srv/wetfish-server`.
    ```bash
    docker logs -f lurker-lurker-1
    ```
+
+6. Add the webhook in GitHub, under the repository's Settings → Webhooks →
+   Add webhook, with what `add-project.sh` printed:
+
+   | Field | Value |
+   | --- | --- |
+   | Payload URL | `https://<server hostname>/hooks/lurker` |
+   | Content type | `application/json` |
+   | Secret | The webhook secret it printed, also in `config/lurker.conf` as `WEBHOOK_SECRET` |
+   | Events | Just the push event |
+
+   GitHub sends a ping when the webhook is added. Under the webhook's Recent
+   Deliveries, it answers 200 with `Ignored a request without a ref: this
+   server deploys main of lurker`, which shows the secret matches. A push to
+   `main` answers `Deploy of lurker main requested` and deploys; pushes to
+   other branches are ignored.
 
 If the first deploy fails, for example because of a mistake in
 `lurker.toml`, the log says why. The project stays added; fix the problem
@@ -133,7 +166,8 @@ The deploy copies the file into the clone. When nothing else changed, the
 container stays as it is, and lurker reads the file again within 30
 seconds without leaving IRC, taking the new admins; an admin can send
 `reload` to have it read the file straight away. Changes to `[irc]`,
-`[rooms]`, `[database]` and `[http]` need a restart, which reconnects:
+`[rooms]`, `[database]`, `[http]` and `[oper]` need a restart, which
+reconnects:
 
 ```bash
 docker restart lurker-lurker-1
@@ -141,7 +175,8 @@ docker restart lurker-lurker-1
 
 ## Updates
 
-Pushing to `main` deploys. To deploy by hand, or follow a deploy:
+Pushing to `main` deploys, through the webhook. To deploy by hand, or
+follow a deploy:
 
 ```bash
 ./deploy.sh lurker

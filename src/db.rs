@@ -22,7 +22,7 @@ use crate::config::Room;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 3] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
+const MIGRATIONS: [&str; 4] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE lurkers (
@@ -92,6 +92,12 @@ CREATE TABLE channels (
 );
 ";
 
+const SCHEMA_V4: &str = "
+-- When lurker last saw them say something, in any channel it is in. A
+-- lurker who speaks after their warning is no longer kicked.
+ALTER TABLE lurkers ADD COLUMN spoke_at INTEGER;
+";
+
 /// How often a lurker chatted in the year they were most active.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Frequency {
@@ -151,13 +157,21 @@ pub struct Lurker {
     pub grace: Option<i64>,
     /// When lurker warned them that they would be kicked
     pub warned_at: Option<i64>,
+    /// When lurker last saw them say something, in any channel it is in
+    pub spoke_at: Option<i64>,
 }
 
 impl Lurker {
-    /// When they are kicked from lurker's channels, once they have been
-    /// warned and have a grace period.
+    /// When they are kicked from every channel, once they have been warned
+    /// and have a grace period.
     pub fn kick_at(&self) -> Option<i64> {
         Some(self.warned_at? + self.grace?)
+    }
+
+    /// Whether they have spoken since their warning, which stops the kicks
+    /// until they are given a grace period again.
+    pub fn released(&self) -> bool {
+        matches!((self.warned_at, self.spoke_at), (Some(warned), Some(spoke)) if spoke > warned)
     }
 }
 
@@ -286,7 +300,7 @@ impl Db {
                 self.conn.execute(
                     "UPDATE lurkers
                      SET room = ?2, here_since = ?3, marked_by = ?4, marked_at = ?5,
-                         next_ping_at = NULL
+                         next_ping_at = NULL, warned_at = NULL
                      WHERE id = ?1",
                     params![id, room.as_str(), here_since, admin, now],
                 )?;
@@ -390,11 +404,21 @@ impl Db {
     }
 
     /// Sets how long after their warning a lurker is kicked, or None for
-    /// never.
+    /// never. Their warning starts over, so they are warned again before
+    /// any kick.
     pub fn set_grace(&self, id: i64, grace: Option<i64>) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE lurkers SET grace = ?2 WHERE id = ?1",
+            "UPDATE lurkers SET grace = ?2, warned_at = NULL WHERE id = ?1",
             params![id, grace],
+        )?;
+        Ok(())
+    }
+
+    /// Records that lurker saw a lurker say something.
+    pub fn set_spoke(&self, id: i64, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE lurkers SET spoke_at = ?2 WHERE id = ?1",
+            params![id, at],
         )?;
         Ok(())
     }
@@ -475,7 +499,7 @@ impl Db {
     fn load(&self, id: i64) -> rusqlite::Result<Lurker> {
         let mut lurker = self.conn.query_row(
             "SELECT nick, room, peak_year, peak_frequency, here_since, marked_by, marked_at,
-                    next_ping_at, fanfare_at, grace, warned_at
+                    next_ping_at, fanfare_at, grace, warned_at, spoke_at
              FROM lurkers WHERE id = ?1",
             [id],
             |row| {
@@ -496,6 +520,7 @@ impl Db {
                     fanfare_at: row.get(8)?,
                     grace: row.get(9)?,
                     warned_at: row.get(10)?,
+                    spoke_at: row.get(11)?,
                 })
             },
         )?;
@@ -579,6 +604,7 @@ mod tests {
         let alice = db.lurker("alice").unwrap().unwrap();
         assert_eq!(alice.next_ping_at, None);
         assert_eq!(alice.fanfare_at, None);
+        assert_eq!((alice.warned_at, alice.spoke_at), (None, None));
     }
 
     #[test]
@@ -596,8 +622,36 @@ mod tests {
         assert_eq!((alice.grace, alice.warned_at), (Some(3600), Some(1000)));
         assert_eq!(alice.kick_at(), Some(4600));
 
+        // A new grace period starts the warning over
+        db.set_grace(id, Some(60)).unwrap();
+        let alice = db.lurker("alice").unwrap().unwrap();
+        assert_eq!((alice.grace, alice.warned_at), (Some(60), None));
+
         db.set_grace(id, None).unwrap();
         assert_eq!(db.lurker("alice").unwrap().unwrap().kick_at(), None);
+    }
+
+    #[test]
+    fn speaking_after_the_warning_releases_lurkers() {
+        let db = Db::open_in_memory();
+        db.mark("alice", Room::Purgatory, false, "rachel", 100)
+            .unwrap();
+        let id = db.lurker("alice").unwrap().unwrap().id;
+        db.set_grace(id, Some(3600)).unwrap();
+
+        // Speaking before any warning changes nothing
+        db.set_spoke(id, 900).unwrap();
+        db.set_warned(id, 1000).unwrap();
+        assert!(!db.lurker("alice").unwrap().unwrap().released());
+
+        db.set_spoke(id, 1100).unwrap();
+        let alice = db.lurker("alice").unwrap().unwrap();
+        assert_eq!(alice.spoke_at, Some(1100));
+        assert!(alice.released());
+
+        // A new grace period starts again
+        db.set_grace(id, Some(60)).unwrap();
+        assert!(!db.lurker("alice").unwrap().unwrap().released());
     }
 
     #[test]
@@ -646,9 +700,12 @@ mod tests {
         db.set_next_ping(id, 500).unwrap();
         db.use_ping(id, 2).unwrap();
 
+        db.set_warned(id, 150).unwrap();
+
         db.mark("alice", Room::Watchlist, false, "rachel", 200)
             .unwrap();
-        assert_eq!(db.lurker("alice").unwrap().unwrap().next_ping_at, None);
+        let alice = db.lurker("alice").unwrap().unwrap();
+        assert_eq!((alice.next_ping_at, alice.warned_at), (None, None));
         assert!(db.used_pings(id).unwrap().is_empty());
     }
 

@@ -366,17 +366,6 @@ pub fn notice(channel: &str, lurker: &Lurker, said: &str, now: i64) -> String {
     )
 }
 
-/// The notice admins get when a lurker was kicked and invited to their room
-/// but hasn't joined it.
-pub fn not_joined(lurker: &Lurker, room: &str, channels: &[String]) -> String {
-    format!(
-        "{nick} was kicked from {} for lurking and invited to {room}, but hasn't joined it. \
-         Sajoin them: /sajoin {nick} {room}",
-        channels.join(", "),
-        nick = lurker.nick
-    )
-}
-
 /// A lurker's message as admins are shown it: an action as `/me`, and cut
 /// short when it is long.
 fn quote(said: &str) -> String {
@@ -477,6 +466,7 @@ mod tests {
             fanfare_at: None,
             grace: Some(3 * DAY),
             warned_at: None,
+            spoke_at: None,
         }
     }
 
@@ -772,16 +762,5 @@ mod tests {
         let text = notice("#purgatory", &carol, &long, NOW);
         assert!(text.contains("(no notes recorded)"), "{text}");
         assert!(text.ends_with("a…\""), "{text}");
-    }
-
-    #[test]
-    fn tells_admins_who_needs_sajoining() {
-        let bob = lurker(Room::Watchlist);
-        let channels = ["#wetfish".to_owned(), "#music".to_owned()];
-        assert_eq!(
-            not_joined(&bob, "#FBI_watchlist", &channels),
-            "Alice was kicked from #wetfish, #music for lurking and invited to #FBI_watchlist, \
-             but hasn't joined it. Sajoin them: /sajoin Alice #FBI_watchlist"
-        );
     }
 }

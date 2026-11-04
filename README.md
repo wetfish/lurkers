@@ -24,11 +24,10 @@ back when it was taken, reconnects after a lost connection, and quits with
 "brb, getting a software update" when it is stopped. Admins mark lurkers and
 record what they know about them with commands, and lurker welcomes each
 lurker to their room, makes a fuss when one speaks, and pings each one about
-once a week. Admins can also invite lurker to other channels, where, given +h
-or +o, it warns marked lurkers and kicks them to their room after their grace
-period. It runs on a Wetfish server at `lurkers.wetfish.net`; see
-[Deploying](docs/deploying.md). Operator powers, so lurker can op itself,
-kick lurkers from every channel and sajoin them into their room, come next.
+once a week. As an [IRC operator](#irc-operator), it warns marked lurkers,
+then kicks them from every channel and sajoins them into their room until
+they speak, and ops itself in the channels admins invite it to. It runs on a
+Wetfish server at `lurkers.wetfish.net`; see [Deploying](docs/deploying.md).
 
 ## Requirements
 
@@ -68,6 +67,7 @@ cp lurker.example.toml lurker.toml
 | `rooms.watchlist` | `#FBI_watchlist` | The room for people nobody knows |
 | `database.path` | `lurker.sqlite` | The [database](#database), created when missing. A relative path is relative to the folder lurker runs in. |
 | `http.listen` | none | Where to serve the [status page](#status-page), such as `0.0.0.0:8080`. Without it, there is no page. |
+| `oper.name`, `oper.password` | none | lurker's [IRC operator](#irc-operator) login. Without it, lurker warns and kicks nobody. |
 | `admins` | none | The [admins](#admins), each in its own `[[admins]]` section with a `nick` and `hosts` |
 
 Settings lurker doesn't know are an error, so typos don't go unnoticed.
@@ -176,7 +176,7 @@ order:
 
 | Field | Means |
 | --- | --- |
-| `grace=<time>` | How long after a warning lurker kicks them from its [channels](#channels): minutes, hours, days or weeks, such as `90m`, `12h`, `3d` or `2w`, or `never` |
+| `grace=<time>` | How long after a [warning](#warnings-and-kicks) lurker kicks them from every channel and sajoins them into their room: minutes, hours, days or weeks, such as `90m`, `12h`, `3d` or `2w`, or `never`. Giving it starts their warning over. |
 | `#channel=<date>` | A channel they idled in, and when they went silent there: when they last spoke, or showed up if they never did |
 | `since=<date>` | The date for every channel given without one, as in `since=180d #wetfish #music` |
 | `peak=<year>/<daily\|weekly\|monthly>` | How often a trusted lurker chatted in the year they were most active |
@@ -199,8 +199,8 @@ have changes its date. lurker checks the whole command before changing
 anything, so a mistake anywhere in it changes nothing.
 
 Marking someone already marked for the other room moves them, and their time
-in the room and their pings start again. Their grace period and channels
-stay.
+in the room, their pings and their warning start again. Their grace period
+and channels stay.
 
 `info` ends with everything recorded about a lurker as one command, such as
 `As one command: untrusted bob grace=3d #music=2026-07-30 #wetfish=2026-05-06`,
@@ -215,38 +215,90 @@ database and joins them, with its rooms, whenever it connects, including
 after a restart. Every minute it rejoins any it isn't in, such as after
 being kicked. `part #channel` makes it leave for good.
 
-In a channel where lurker has +h or higher, it deals with marked lurkers who
-have a grace period:
+As an IRC operator, lurker gives itself +o with SAMODE in each of these
+channels where it isn't opped, but not in its rooms. If someone takes +o
+away, it waits 10 minutes before taking it back, so it never fights anyone
+over it. It learns its status from the list of names when it joins and from
+mode changes after that, and asks the server for the `multi-prefix`
+capability so the list of names shows all of it.
 
-1. **Warning:** the first time lurker sees a lurker there, it warns them in
-   the channel, in the voice of their room, that it will take them to their
-   room after their grace period.
-2. **Kick:** once their grace period after the warning is over, lurker kicks
-   them from every channel of its where it can kick and they are, and kicks
-   them again whenever they come back.
-3. **Invite:** after kicking someone, lurker invites them to their room, if
-   they aren't in it.
-4. **Sajoin notice:** if they haven't joined their room 2 minutes after the
-   invite, lurker sends every admin a notice asking them to sajoin them:
+## Warnings and kicks
 
-```text
-bob was kicked from #wetfish for lurking and invited to #FBI_watchlist, but hasn't joined it. Sajoin them: /sajoin bob #FBI_watchlist
+As an IRC operator, lurker deals with every marked lurker who has a grace
+period, wherever they are:
+
+1. **Warning:** as soon as lurker finds them online, it warns them, in the
+   voice of their room, that it will take them to their room after their
+   grace period. It warns them in one of its channels if they are in one,
+   and otherwise in a private message. It checks every minute which lurkers
+   are online, with ISON.
+2. **Kicks:** once their grace period after the warning is over, lurker
+   looks them up with WHOIS and kicks them, with SAKICK, from every channel
+   they are in apart from their room, including secret ones, then sajoins
+   them into their room if they aren't in it. It looks them up again every 5
+   minutes while they are online, and straight away when they join one of
+   lurker's channels, so they can't settle anywhere else.
+3. **Release:** a lurker who says something after their warning, in any
+   channel lurker is in, isn't kicked any more. Most will speak in their
+   room, where lurker makes a fuss and tells the admins. Marking them again
+   with `grace=` starts over with a new warning.
+
+Lurkers with no grace period are never warned or kicked, and lurker never
+acts on its own nick. `info <nick>` says where a lurker is in this. lurker
+logs every warning, kick and sajoin, and the server notices about its
+commands, such as one it wasn't allowed to use.
+
+Without an IRC operator login, or when the server refuses it, lurker warns
+and kicks nobody. When the server refuses it, lurker tells every admin who
+is online.
+
+## IRC operator
+
+lurker logs in with OPER as soon as it connects, with `name` and `password`
+from `[oper]` in its settings:
+
+```toml
+[oper]
+name = "lurker"
+password = "the plain password"
 ```
 
-Lurkers with no grace period are never warned or kicked. lurker never kicks
-anyone from its own rooms. It learns its own status in a channel from the
-list of names when it joins, and from mode changes after that; it asks the
-server for the `multi-prefix` capability so it knows it keeps +h when it
-loses +o. A lurker who joined lurker's channel while lurker had no +h or +o
-is warned as soon as lurker is given it.
+On the IRC server, which runs InspIRCd 3.9 with `m_sajoin`, `m_sakick` and
+`m_samode` loaded, its oper block in `opers.conf` needs these commands and
+privileges, and nothing more:
+
+```text
+<class name="LurkerBot"
+     commands="SAJOIN SAKICK SAMODE"
+     privs="users/sajoin-others users/channel-spy channels/auspex">
+
+<type name="Lurker_Bot" classes="LurkerBot" vhost="lurkers.wetfish.net">
+
+<oper name="lurker"
+      hash="hmac-sha256"
+      password="<the output of /MKPASSWD hmac-sha256 <password>>"
+      host="lurker@<the address lurker connects from>"
+      sslonly="yes"
+      type="Lurker_Bot">
+```
+
+| Needed | For |
+| --- | --- |
+| `SAKICK` | Kicking lurkers from channels lurker isn't in |
+| `SAJOIN` and `users/sajoin-others` | Sajoining lurkers into their room; InspIRCd 3.9 only lets an oper sajoin themselves without the privilege |
+| `SAMODE` | Giving itself +o in its channels |
+| `users/channel-spy` | Seeing a lurker's secret and private channels in WHOIS, so it kicks them from those too |
+| `channels/auspex` | Seeing everyone in `+u` (auditorium) channels |
+
+The server notices every SAKICK and SAJOIN to opers with snomask `a`.
 
 ## Lurkers
 
 lurker only pays attention to the lurkers admins mark. Anyone else in the
 rooms, such as people curious about what happens there, is left alone and
-never recorded. lurker can't put anyone in a room: it kicks lurkers from its
-other channels and invites them to their room, and admins sajoin those who
-don't come.
+never recorded. lurker only puts lurkers in their room once they have been
+warned and their grace period is over; see
+[Warnings and kicks](#warnings-and-kicks).
 
 A lurker is known by their nick, ignoring case. When lurker sees a lurker
 change nick in one of its rooms, it follows them to the new nick. Someone who
@@ -272,8 +324,8 @@ lurker talks to lurkers in their own room only, and never to anyone else:
   said. After that it stays quiet about them for a day, so a lurker who keeps
   talking isn't drowned in fanfare. Admins who aren't online miss the
   notice; it isn't kept for later.
-- **Warnings and kicks:** see [Channels](#channels). Their messages are in
-  the voice of the lurker's room, wherever lurker is.
+- **Warnings and kicks:** see [Warnings and kicks](#warnings-and-kicks).
+  Their messages are in the voice of the lurker's room, wherever lurker is.
 - **Pings:** each lurker is pinged about once a week. The first ping comes 3
   to 7 days after they first join their room; a lurker who joined longer ago
   than that, such as one marked while sitting there for weeks, is pinged
@@ -376,8 +428,9 @@ Times are whole seconds since 1970 UTC. In `sqlite3`,
 | `marked_by`, `marked_at` | The admin who last marked them, and when |
 | `next_ping_at` | When lurker next pings them, set once their time in the room has started |
 | `fanfare_at` | When lurker last made a fuss about them speaking |
-| `grace` | How many seconds after their warning they are kicked from lurker's channels, or empty for never |
-| `warned_at` | When lurker warned them |
+| `grace` | How many seconds after their warning they are kicked from every channel, or empty for never |
+| `warned_at` | When lurker warned them, or empty until it does, and again after a new grace period or a move to the other room |
+| `spoke_at` | When lurker last saw them say something, in any channel it is in. After `warned_at`, it stops the kicks. |
 
 `lurker_channels` has the channels each lurker idled in:
 

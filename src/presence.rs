@@ -62,6 +62,12 @@ impl Presence {
             .is_some_and(|nicks| nicks.contains(&casemap::fold(nick)))
     }
 
+    /// Whether someone is in any of lurker's channels.
+    pub fn anywhere(&self, nick: &str) -> bool {
+        let nick = casemap::fold(nick);
+        self.channels.values().any(|nicks| nicks.contains(&nick))
+    }
+
     /// How many people lurker knows are in a channel.
     pub fn count(&self, channel: &str) -> usize {
         self.channels
@@ -81,12 +87,14 @@ mod tests {
         presence.add("#wetfish", "alice");
         presence.add("#Purgatory", "bob");
         assert!(presence.contains("#PURGATORY", "ALICE"));
+        assert!(presence.anywhere("ALICE"));
         assert_eq!(presence.count("#purgatory"), 2);
 
         assert!(presence.remove("#purgatory", "bob"));
         assert!(!presence.remove("#purgatory", "bob"));
         assert!(presence.quit("alice"));
         assert!(!presence.quit("alice"));
+        assert!(!presence.anywhere("alice"));
         assert_eq!(presence.count("#wetfish"), 0);
     }
 

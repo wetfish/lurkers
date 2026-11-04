@@ -111,7 +111,8 @@ pub fn help(rooms: &Rooms) -> Vec<String> {
              a lurker for {watchlist}, someone nobody can vouch for"
         ),
         "Fields go in any order, and only the ones given change. grace is how long after a \
-         warning I kick them from my channels: 90m, 12h, 3d, 2w or never"
+         warning I kick them from every channel and sajoin them into their room: 90m, 12h, 3d, \
+         2w or never. Giving it starts the warning over"
             .to_owned(),
         "#channel=<date> is when they went silent there: when they last spoke, or showed up if \
          they never did. Dates are YYYY-MM-DD or days ago, such as 180d. since is the date for \
@@ -122,11 +123,11 @@ pub fn help(rooms: &Rooms) -> Vec<String> {
         "list: every lurker, and who is in their room now".to_owned(),
         "forget <nick>: delete a lurker".to_owned(),
         "poke <nick>: send a lurker their weekly ping now".to_owned(),
-        "join <#channel>: join a channel, where I warn and kick lurkers once I have +h or +o. \
-         Inviting me does the same"
+        "join <#channel>: join a channel and op myself there, to watch for lurkers. Inviting \
+         me does the same"
             .to_owned(),
         "part <#channel>: leave a channel".to_owned(),
-        "channels: the channels I'm in, and where I can kick".to_owned(),
+        "channels: the channels I'm in, and whether I'm opped there".to_owned(),
         "reload: read the settings file again".to_owned(),
     ]
 }
@@ -142,7 +143,7 @@ fn mark(context: &Context, args: &[&str], room: Room) -> Reply {
     if fields.grace.is_none() && context.db.lurker(nick)?.is_none() {
         return Err(format!(
             "Give a grace period too, such as: {trust} {nick} grace=3d. It is how long after a \
-             warning I kick them from my channels, or never."
+             warning I kick them from every channel and sajoin them into their room, or never."
         )
         .into());
     }
@@ -374,20 +375,25 @@ fn info(context: &Context, args: &[&str]) -> Reply {
         (None, None) => format!("Next ping: after they first join {channel}."),
     });
 
+    let warned = dates::today(lurker.warned_at.unwrap_or_default());
     lines.push(match (lurker.grace, lurker.kick_at()) {
-        (None, _) => "Kicks: never kicked from my channels.".to_owned(),
+        (None, _) => "Kicks: never warned or kicked.".to_owned(),
+        _ if lurker.released() => format!(
+            "Kicks: stopped, since they spoke on {} after being warned. A new grace period \
+             starts them again.",
+            dates::today(lurker.spoke_at.unwrap_or_default())
+        ),
         (Some(grace), None) => format!(
-            "Kicks: warned when I see them in a channel where I can kick, and kicked {} later.",
+            "Kicks: warned the next time I find them online, and kicked {} later.",
             dates::length(grace)
         ),
         (Some(_), Some(at)) if at > context.now => format!(
-            "Kicks: warned on {}, kicked from my channels in {}.",
-            dates::today(lurker.warned_at.unwrap_or(at)),
+            "Kicks: warned on {warned}, kicked from every channel in {}.",
             dates::about(at - context.now)
         ),
         (Some(_), Some(_)) => format!(
-            "Kicks: warned on {}, kicked from my channels on sight.",
-            dates::today(lurker.warned_at.unwrap_or_default())
+            "Kicks: warned on {warned}, kicked from every channel and sajoined into {channel} \
+             whenever they're online."
         ),
     });
 
@@ -502,15 +508,15 @@ fn describe_channel(channel: &str, since: NaiveDate, today: NaiveDate) -> String
     )
 }
 
-/// How a lurker is kicked, such as "kicked from my channels 3 days after
+/// How a lurker is kicked, such as "kicked from every channel 3 days after
 /// being warned".
 fn kicked(grace: Option<i64>) -> String {
     match grace {
         Some(grace) => format!(
-            "kicked from my channels {} after being warned",
+            "kicked from every channel {} after being warned",
             dates::length(grace)
         ),
-        None => "never kicked from my channels".to_owned(),
+        None => "never warned or kicked".to_owned(),
     }
 }
 
@@ -617,7 +623,7 @@ mod tests {
             fixture
                 .run("trusted alice grace=3d #wetfish=348d #dryfish=2026-11-01 peak=2022/weekly"),
             [
-                "alice is marked trusted (#purgatory). Kicked from my channels 3 days after being \
+                "alice is marked trusted (#purgatory). Kicked from every channel 3 days after being \
                  warned. Chatted every week in 2022.",
                 "Channels: #wetfish silent since 2025-11-19 (348 days), #dryfish silent since \
                  2026-11-01 (1 day)",
@@ -642,7 +648,7 @@ mod tests {
         assert_eq!(
             fixture.run("untrusted bob #music since=180d #wetfish=95d GRACE=12h"),
             [
-                "bob is marked untrusted (#FBI_watchlist). Kicked from my channels 12 hours after \
+                "bob is marked untrusted (#FBI_watchlist). Kicked from every channel 12 hours after \
                  being warned. Their time in #FBI_watchlist starts counting when they join it.",
                 "Channels: #music silent since 2026-05-06 (180 days), #wetfish silent since \
                  2026-07-30 (95 days)",
@@ -663,7 +669,7 @@ mod tests {
         assert_eq!(
             fixture.run("untrusted bob grace=never #music=10d #WETFISH=95d"),
             [
-                "bob is already marked untrusted (#FBI_watchlist). Never kicked from my channels.",
+                "bob is already marked untrusted (#FBI_watchlist). Never warned or kicked.",
                 "Channels: #music silent since 2026-10-23 (10 days), #WETFISH silent since \
                  2026-07-30 (95 days)",
             ]
@@ -705,7 +711,8 @@ mod tests {
             fixture.run("trusted alice #wetfish=1d"),
             [
                 "Give a grace period too, such as: trusted alice grace=3d. It is how long after \
-                 a warning I kick them from my channels, or never."
+                 a warning I kick them from every channel and sajoin them into their room, or \
+                 never."
             ]
         );
         assert_eq!(fixture.db.lurker("alice").unwrap(), None);
@@ -810,8 +817,7 @@ mod tests {
                 "Channels: #dryfish silent since 2026-11-01 (1 day), #wetfish silent since \
                  2025-11-19 (348 days)",
                 "Next ping: being scheduled.",
-                "Kicks: warned when I see them in a channel where I can kick, and kicked 3 days \
-                 later.",
+                "Kicks: warned the next time I find them online, and kicked 3 days later.",
                 "Most active: chatted every week in 2022.",
                 "As one command: trusted alice grace=3d #dryfish=2026-11-01 #wetfish=2025-11-19 \
                  peak=2022/weekly",
@@ -826,7 +832,7 @@ mod tests {
                  Marked by rachel on 2026-11-02.",
                 "No channels yet. Add them with: untrusted bob #channel=<date>",
                 "Next ping: after they first join #FBI_watchlist.",
-                "Kicks: never kicked from my channels.",
+                "Kicks: never warned or kicked.",
                 "As one command: untrusted bob grace=never",
             ]
         );
@@ -878,14 +884,31 @@ mod tests {
         let info = fixture.run("info bob");
         assert_eq!(
             info[3],
-            "Kicks: warned on 2026-11-01, kicked from my channels in 2 days."
+            "Kicks: warned on 2026-11-01, kicked from every channel in 2 days."
         );
 
         fixture.db.set_warned(id, NOW - 4 * DAY).unwrap();
         let info = fixture.run("info bob");
         assert_eq!(
             info[3],
-            "Kicks: warned on 2026-10-29, kicked from my channels on sight."
+            "Kicks: warned on 2026-10-29, kicked from every channel and sajoined into \
+             #FBI_watchlist whenever they're online."
+        );
+
+        fixture.db.set_spoke(id, NOW - DAY).unwrap();
+        let info = fixture.run("info bob");
+        assert_eq!(
+            info[3],
+            "Kicks: stopped, since they spoke on 2026-11-01 after being warned. A new grace \
+             period starts them again."
+        );
+
+        // Giving a grace period again starts over
+        fixture.run("untrusted bob grace=1h");
+        let info = fixture.run("info bob");
+        assert_eq!(
+            info[3],
+            "Kicks: warned the next time I find them online, and kicked 1 hour later."
         );
     }
 

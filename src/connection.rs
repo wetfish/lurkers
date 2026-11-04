@@ -1,12 +1,13 @@
-//! Keeps lurker on IRC: connects over TLS, joins its rooms and the channels
-//! admins asked it to join, rejoins them when needed, takes its nick back
-//! when it was taken, reconnects after a lost connection, and quits with a
-//! message when lurker is stopped. Along the way it follows who is in its
-//! channels, answers admins, and deals with lurkers: a welcome when they
-//! first join their room, fanfare when they speak, a ping about once a week,
-//! and in channels where lurker has +h or +o, a warning and then a kick.
+//! Keeps lurker on IRC: connects over TLS, logs in as an IRC operator, joins
+//! its rooms and the channels admins asked it to join, rejoins them when
+//! needed, takes its nick back when it was taken, reconnects after a lost
+//! connection, and quits with a message when lurker is stopped. Along the
+//! way it follows who is in its channels, answers admins, and deals with
+//! lurkers: a welcome when they first join their room, fanfare when they
+//! speak, a ping about once a week, and, as an IRC operator, a warning and
+//! then kicks from every channel and a sajoin into their room.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,7 @@ use tokio::time::{self, Instant, MissedTickBehavior};
 use crate::admin;
 use crate::casemap;
 use crate::config::{Room, Settings};
+use crate::dates;
 use crate::db::{Db, Lurker, NickChange};
 use crate::http::Status;
 use crate::messages::{self, Facts, Kind, Messages};
@@ -46,7 +48,8 @@ const REJOIN_INTERVAL: Duration = Duration::from_secs(60);
 /// How often to check whether the settings file changed.
 const SETTINGS_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How often to check whether a lurker's ping, warning or kick is due.
+/// How often to check on lurkers: pings, warnings and kicks that are due,
+/// and which lurkers are online.
 const LURKER_INTERVAL: Duration = Duration::from_secs(60);
 
 /// After making a fuss about a lurker speaking, lurker stays quiet about
@@ -54,9 +57,17 @@ const LURKER_INTERVAL: Duration = Duration::from_secs(60);
 /// in fanfare and admins aren't flooded with notices.
 const FANFARE_COOLDOWN: i64 = 24 * 3600;
 
-/// How many seconds a kicked lurker has to join their room after being
-/// invited, before admins are asked to sajoin them.
-const INVITE_WAIT: i64 = 120;
+/// How often lurker looks up a lurker whose grace period is over, to kick
+/// them from channels they joined since. Joining one of lurker's channels
+/// gets them kicked straight away.
+const SWEEP_INTERVAL: i64 = 5 * 60;
+
+/// How long lurker waits before giving itself +o again in a channel, so it
+/// never fights someone over it.
+const OP_RETRY: i64 = 10 * 60;
+
+/// The most nicks lurker asks about in one ISON, in bytes.
+const ISON_LENGTH: usize = 400;
 
 /// The wait before reconnecting, doubled after each attempt up to
 /// `MAX_RETRY_DELAY`.
@@ -131,7 +142,7 @@ async fn connect(
     };
 
     // multi-prefix lists every status a nick has in the names list, so
-    // lurker knows it can still kick after losing +o while keeping +h
+    // lurker knows whether it is still opped after a mode change
     client
         .send_cap_req(&[Capability::MultiPrefix])
         .map_err(|err| describe(&err))?;
@@ -169,12 +180,7 @@ async fn serve(
                 session.check_settings();
                 Vec::new()
             }
-            _ = lurkers.tick() => {
-                let now = unix_now();
-                let mut commands = session.ping_due(now);
-                commands.extend(session.enforce(now));
-                commands
-            }
+            _ = lurkers.tick() => session.tick(unix_now()),
             () = shutdown.recv() => {
                 quit(client, stream).await;
                 return Ok(());
@@ -282,16 +288,26 @@ fn status_of_mode(mode: &ChannelMode) -> Option<char> {
     }
 }
 
-/// Whether a channel status lets lurker kick: +h or higher.
-fn can_kick_with(status: char) -> bool {
-    "qaoh".contains(status)
+/// Whether a channel status is +o or higher.
+fn is_op(status: char) -> bool {
+    "qao".contains(status)
 }
 
-/// A lurker kicked from lurker's channels and invited to their room, who
-/// admins are asked to sajoin if they don't join it.
-struct Invited {
-    at: i64,
-    from: Vec<String>,
+/// The channels a WHOIS reply lists, without the status prefixes in front
+/// of them, such as `@` in `@#wetfish`. `&` is a status prefix too, so only
+/// `#` starts a channel name.
+fn whois_channels(list: &str) -> impl Iterator<Item = &str> {
+    list.split_whitespace()
+        .filter_map(|entry| entry.find('#').map(|start| &entry[start..]))
+}
+
+/// What a WHOIS lurker asked for has said so far.
+#[derive(Default)]
+struct Lookup {
+    /// Whether the server knows the nick
+    found: bool,
+    /// The channels they are in
+    channels: Vec<String>,
 }
 
 /// What lurker knows about its current connection.
@@ -305,17 +321,28 @@ struct Session<'a> {
     nick: String,
     /// Whether the server has accepted the connection
     registered: bool,
+    /// Whether lurker is logged in as an IRC operator, which it needs to
+    /// warn and kick lurkers
+    opered: bool,
     /// The channels lurker is in, folded
     joined: HashSet<String>,
     /// lurker's own status in each channel, such as `o` for +o, by folded
     /// channel name
     status: HashMap<String, HashSet<char>>,
+    /// When lurker last gave itself +o in each channel, by folded name
+    op_asked: HashMap<String, i64>,
     /// Who else is in them
     presence: Presence,
     /// When lurker last pinged someone in each room, to space pings out
     last_ping: HashMap<Room, i64>,
-    /// Lurkers kicked and invited to their room, by lurker id
-    invited: HashMap<i64, Invited>,
+    /// Folded nicks of lurkers the server last said were online
+    online: HashSet<String>,
+    /// The nicks in each ISON sent, oldest first, to match the replies to
+    ison: VecDeque<Vec<String>>,
+    /// The WHOIS replies being collected, by folded nick
+    lookups: HashMap<String, Lookup>,
+    /// When lurker last kicked each lurker from their channels, by id
+    swept: HashMap<i64, i64>,
 }
 
 impl<'a> Session<'a> {
@@ -328,11 +355,16 @@ impl<'a> Session<'a> {
             rng: Rng::from_clock(),
             nick,
             registered: false,
+            opered: false,
             joined: HashSet::new(),
             status: HashMap::new(),
+            op_asked: HashMap::new(),
             presence: Presence::default(),
             last_ping: HashMap::new(),
-            invited: HashMap::new(),
+            online: HashSet::new(),
+            ison: VecDeque::new(),
+            lookups: HashMap::new(),
+            swept: HashMap::new(),
         }
     }
 
@@ -349,6 +381,21 @@ impl<'a> Session<'a> {
                 }
                 self.registered = true;
                 eprintln!("Connected as {}", self.nick);
+                commands.extend(self.oper_up());
+            }
+
+            // Logging in as an IRC operator
+            Command::Response(Response::RPL_YOUREOPER, _) => {
+                self.opered = true;
+                eprintln!("Logged in as an IRC operator");
+                commands.extend(self.op_myself(now));
+                commands.extend(self.enforce(now));
+            }
+            Command::Response(
+                response @ (Response::ERR_PASSWDMISMATCH | Response::ERR_NOOPERHOST),
+                args,
+            ) => {
+                commands.extend(self.oper_failed(*response, args.last()));
             }
 
             // Who was already in a channel when lurker joined it
@@ -363,9 +410,39 @@ impl<'a> Session<'a> {
             Command::Response(Response::RPL_ENDOFNAMES, args) => {
                 if let Some(channel) = args.get(1) {
                     self.log_channel(channel);
-                    if self.room_of(channel).is_none() {
-                        commands.extend(self.enforce(now));
-                    }
+                    commands.extend(self.op_myself(now));
+                    commands.extend(self.enforce(now));
+                }
+            }
+
+            // Which lurkers are online, and where
+            Command::Response(Response::RPL_ISON, args) => {
+                self.ison_reply(args.last().map_or("", String::as_str));
+                commands.extend(self.enforce(now));
+            }
+            Command::Response(Response::RPL_WHOISUSER, args) => {
+                if let Some(nick) = args.get(1)
+                    && let Some(lookup) = self.lookup(nick)
+                {
+                    lookup.found = true;
+                }
+            }
+            Command::Response(Response::RPL_WHOISCHANNELS, args) => {
+                if let [_, nick, list, ..] = args.as_slice()
+                    && let Some(lookup) = self.lookup(nick)
+                {
+                    lookup
+                        .channels
+                        .extend(whois_channels(list).map(str::to_owned));
+                }
+            }
+            Command::Response(Response::ERR_NOSUCHNICK, args)
+                if args
+                    .get(1)
+                    .is_some_and(|nick| self.lookups.contains_key(&casemap::fold(nick))) => {}
+            Command::Response(Response::RPL_ENDOFWHOIS, args) => {
+                if let Some(nick) = args.get(1) {
+                    commands.extend(self.looked_up(nick, now));
                 }
             }
 
@@ -377,10 +454,10 @@ impl<'a> Session<'a> {
                         continue;
                     }
                     self.presence.add(channel, source);
-                    match self.room_of(channel) {
-                        Some(room) => commands.extend(self.seen(room, source, true, now)),
-                        None => commands.extend(self.enforce(now)),
+                    if let Some(room) = self.room_of(channel) {
+                        commands.extend(self.seen(room, source, true, now));
                     }
+                    commands.extend(self.arrived(channel, source, now));
                 }
             }
             Command::PART(channels, _) => {
@@ -407,6 +484,7 @@ impl<'a> Session<'a> {
                 }
             }
             Command::QUIT(_) => {
+                self.online.remove(&casemap::fold(source));
                 if self.presence.quit(source) && self.is_lurker(source) {
                     eprintln!("Lurker {source} quit");
                 }
@@ -418,6 +496,9 @@ impl<'a> Session<'a> {
             }
             Command::NICK(new_nick) => {
                 self.presence.rename(source, new_nick);
+                if self.online.remove(&casemap::fold(source)) {
+                    self.online.insert(casemap::fold(new_nick));
+                }
                 match log_db(self.db.rename(source, new_nick)) {
                     Some(NickChange::Followed) => eprintln!("Lurker {source} is now {new_nick}"),
                     Some(NickChange::Taken) => eprintln!(
@@ -430,7 +511,7 @@ impl<'a> Session<'a> {
             }
             Command::ChannelMODE(channel, modes) => {
                 if self.mode_changed(channel, modes) {
-                    commands.extend(self.enforce(now));
+                    commands.extend(self.op_myself(now));
                 }
             }
 
@@ -450,6 +531,11 @@ impl<'a> Session<'a> {
             {
                 commands.extend(self.channel_message(message, target, text, now));
             }
+            // What the server says about lurker's own commands, such as a
+            // SAJOIN it wasn't allowed
+            Command::NOTICE(target, text) if self.is_me(target) && source.is_empty() => {
+                eprintln!("Server notice: {text}");
+            }
 
             Command::ERROR(text) => eprintln!("Server error: {text}"),
             Command::Response(response, args) if (400..600).contains(&(*response as u16)) => {
@@ -458,6 +544,17 @@ impl<'a> Session<'a> {
             _ => {}
         }
 
+        commands
+    }
+
+    /// What lurker does every minute: sends pings that are due, gives itself
+    /// +o where it lost it, asks which lurkers are online, and warns and
+    /// kicks those that are due.
+    fn tick(&mut self, now: i64) -> Vec<Command> {
+        let mut commands = self.ping_due(now);
+        commands.extend(self.op_myself(now));
+        commands.extend(self.check_online(now));
+        commands.extend(self.enforce(now));
         commands
     }
 
@@ -484,6 +581,33 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// OPER with the login in the settings, if there is one.
+    fn oper_up(&self) -> Option<Command> {
+        let Some(oper) = &self.settings.config.oper else {
+            eprintln!("No [oper] in the settings, so lurker won't warn or kick anyone");
+            return None;
+        };
+        eprintln!("Logging in as IRC operator {}", oper.name);
+        Some(Command::OPER(oper.name.clone(), oper.password.clone()))
+    }
+
+    /// Logs a refused OPER, and tells the admins, since lurker can't warn or
+    /// kick anyone without it.
+    fn oper_failed(&self, response: Response, text: Option<&String>) -> Vec<Command> {
+        let reason = text.map_or_else(|| format!("{response:?}"), String::clone);
+        eprintln!("error: the server refused lurker's IRC operator login: {reason}");
+        let notice = format!(
+            "I couldn't log in as an IRC operator ({reason}), so I can't op myself, kick or \
+             sajoin lurkers. Check [oper] in lurker.toml and the oper block on the IRC server."
+        );
+        self.settings
+            .config
+            .admins
+            .iter()
+            .map(|admin| Command::PRIVMSG(admin.nick.clone(), notice.clone()))
+            .collect()
+    }
+
     /// Answers an admin's private message, or ignores anyone else.
     fn private_message(&mut self, message: &Message, text: &str, now: i64) -> Vec<Command> {
         let Some(nick) = self.admin_nick(message) else {
@@ -504,7 +628,8 @@ impl<'a> Session<'a> {
 
     /// A message in a channel. An admin starting it with lurker's nick gives
     /// a command, answered in the channel. Otherwise it may be a lurker
-    /// speaking in their room.
+    /// speaking, which stops their kicks, and in their room plays the
+    /// fanfare.
     fn channel_message(
         &mut self,
         message: &Message,
@@ -525,6 +650,7 @@ impl<'a> Session<'a> {
         }
 
         let source = message.source_nickname().unwrap_or("");
+        self.heard(channel, source, now);
         match self.room_of(channel) {
             Some(room) => self.spoke(room, source, text, now),
             None => Vec::new(),
@@ -587,7 +713,9 @@ impl<'a> Session<'a> {
                     admin,
                     now,
                 };
-                (Vec::new(), admin::run(&context, text))
+                let lines = admin::run(&context, text);
+                // Marking someone may make a warning due
+                (self.enforce(now), lines)
             }
         }
     }
@@ -638,9 +766,7 @@ impl<'a> Session<'a> {
         eprintln!("Joining {channel}, as {admin} asked");
         (
             vec![Command::JOIN((*channel).to_owned(), None, None)],
-            vec![format!(
-                "Joining {channel}. Give me +h or +o there so I can warn and kick lurkers."
-            )],
+            vec![format!("Joining {channel}.")],
         )
     }
 
@@ -666,28 +792,34 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// `channels`: the channels admins asked lurker to join, and whether it
-    /// can kick in each.
+    /// `channels`: the channels admins asked lurker to join, whether it is
+    /// opped in each, and whether it is an IRC operator.
     fn channels_report(&self) -> String {
+        let oper = if self.opered {
+            "I'm logged in as an IRC operator, so I warn and kick lurkers."
+        } else {
+            "I'm not logged in as an IRC operator, so I don't warn or kick anyone."
+        };
         let channels = log_db(self.db.channels()).unwrap_or_default();
         if channels.is_empty() {
-            return "I'm only in my rooms. Invite me to a channel, or send: join <#channel>"
-                .to_owned();
+            return format!(
+                "I'm only in my rooms. Invite me to a channel, or send: join <#channel>. {oper}"
+            );
         }
         let described: Vec<String> = channels
             .iter()
             .map(|channel| {
                 let state = if !self.joined.contains(&casemap::fold(channel)) {
                     "not in it right now"
-                } else if self.can_kick(channel) {
-                    "can kick"
+                } else if self.has_op(channel) {
+                    "opped"
                 } else {
-                    "needs +h or +o"
+                    "not opped"
                 };
                 format!("{channel} ({state})")
             })
             .collect();
-        format!("My channels: {}", described.join(", "))
+        format!("My channels: {}. {oper}", described.join(", "))
     }
 
     /// An admin's `poke <nick>`: the lurker's ping, sent now. Returns the
@@ -789,48 +921,110 @@ impl<'a> Session<'a> {
         Some(Command::PRIVMSG(channel, text))
     }
 
-    /// Deals with lurkers who have a grace period and are in a channel where
-    /// lurker can kick: warns them once, and kicks them once their grace
-    /// period after the warning is over, inviting them to their room. Also
-    /// asks admins to sajoin lurkers who were invited a while ago and
-    /// haven't joined.
-    fn enforce(&mut self, now: i64) -> Vec<Command> {
+    /// Lurkers lurker warns and kicks: those with a grace period who haven't
+    /// spoken since their warning, apart from lurker itself.
+    fn enforceable(&self, lurker: &Lurker) -> bool {
+        lurker.grace.is_some() && !lurker.released() && !self.is_own_nick(&lurker.nick)
+    }
+
+    /// Whether lurker needs to know if a lurker is online: to warn them, or
+    /// once their grace period is over, to kick them.
+    fn wanted_online(&self, lurker: &Lurker, now: i64) -> bool {
+        self.enforceable(lurker) && lurker.kick_at().is_none_or(|at| at <= now)
+    }
+
+    /// ISON for the lurkers lurker needs to know are online, as an IRC
+    /// operator. The replies come back in the same order.
+    fn check_online(&mut self, now: i64) -> Vec<Command> {
+        if !self.opered {
+            return Vec::new();
+        }
         let Some(lurkers) = log_db(self.db.lurkers()) else {
             return Vec::new();
         };
-        let kickable: Vec<String> = log_db(self.db.channels())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|channel| self.can_kick(channel))
-            .collect();
 
-        let mut commands = Vec::new();
-        for lurker in &lurkers {
-            if lurker.grace.is_none() {
-                continue;
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        let mut length = 0;
+        for lurker in lurkers
+            .iter()
+            .filter(|lurker| self.wanted_online(lurker, now))
+        {
+            if batches.is_empty() || length + lurker.nick.len() >= ISON_LENGTH {
+                batches.push(Vec::new());
+                length = 0;
             }
-            let present: Vec<String> = kickable
-                .iter()
-                .filter(|channel| self.presence.contains(channel, &lurker.nick))
-                .cloned()
-                .collect();
-            let Some(first) = present.first() else {
-                continue;
-            };
+            if let Some(batch) = batches.last_mut() {
+                batch.push(lurker.nick.clone());
+            }
+            length += lurker.nick.len() + 1;
+        }
 
+        self.ison.extend(batches.iter().cloned());
+        batches.into_iter().map(Command::ISON).collect()
+    }
+
+    /// Notes which nicks an ISON reply says are online.
+    fn ison_reply(&mut self, list: &str) {
+        let Some(asked) = self.ison.pop_front() else {
+            return;
+        };
+        let online: HashSet<String> = list.split_whitespace().map(casemap::fold).collect();
+        for nick in asked {
+            let nick = casemap::fold(&nick);
+            if online.contains(&nick) {
+                self.online.insert(nick);
+            } else {
+                self.online.remove(&nick);
+            }
+        }
+    }
+
+    /// Whether a nick is online, as far as lurker knows: in one of its
+    /// channels, or listed by the last ISON.
+    fn is_online(&self, nick: &str) -> bool {
+        self.presence.anywhere(nick) || self.online.contains(&casemap::fold(nick))
+    }
+
+    /// Deals with every lurker who has a grace period, while lurker is an
+    /// IRC operator: warns those who are online and haven't been warned,
+    /// and looks up where those whose grace period is over are, to kick
+    /// them from there.
+    fn enforce(&mut self, now: i64) -> Vec<Command> {
+        if !self.opered {
+            return Vec::new();
+        }
+        let Some(lurkers) = log_db(self.db.lurkers()) else {
+            return Vec::new();
+        };
+
+        let due: Vec<Lurker> = lurkers
+            .into_iter()
+            .filter(|lurker| self.enforceable(lurker))
+            .collect();
+        let mut commands = Vec::new();
+        for lurker in &due {
             match lurker.kick_at() {
-                None => commands.extend(self.warn(lurker, first, now)),
-                Some(at) if at <= now => commands.extend(self.kick(lurker, &present, now)),
+                None => commands.extend(self.warn(lurker, now)),
+                Some(at) if at <= now => commands.extend(self.look_up(lurker, now)),
                 Some(_) => {}
             }
         }
-
-        commands.extend(self.ask_for_sajoins(&lurkers, now));
         commands
     }
 
-    /// Warns a lurker in a channel that they will be kicked.
-    fn warn(&mut self, lurker: &Lurker, channel: &str, now: i64) -> Option<Command> {
+    /// Warns a lurker that they will be kicked: in one of lurker's channels
+    /// they are in, or otherwise in a private message, if they are online.
+    fn warn(&mut self, lurker: &Lurker, now: i64) -> Option<Command> {
+        let target = match self
+            .patrolled()
+            .into_iter()
+            .find(|channel| self.presence.contains(channel, &lurker.nick))
+        {
+            Some(channel) => channel,
+            None if self.is_online(&lurker.nick) => lurker.nick.clone(),
+            None => return None,
+        };
+
         let room = self.room_channel(lurker.room).to_owned();
         let facts = Facts {
             lurker,
@@ -841,21 +1035,69 @@ impl<'a> Session<'a> {
             .messages
             .choose(Kind::Warning, &facts, &mut self.rng, &[])?;
         log_db(self.db.set_warned(lurker.id, now));
+        let place = if target.starts_with(['#', '&']) {
+            format!("in {target}")
+        } else {
+            "in a private message".to_owned()
+        };
         eprintln!(
-            "Warned {} in {channel}; kicked in {}",
+            "Warned {} {place}; kicked in {}",
             lurker.nick,
-            crate::dates::length(lurker.grace.unwrap_or_default())
+            dates::length(lurker.grace.unwrap_or_default())
         );
-        Some(Command::PRIVMSG(channel.to_owned(), warning))
+        Some(Command::PRIVMSG(target, warning))
     }
 
-    /// Kicks a lurker from channels, and invites them to their room if they
-    /// aren't in it.
-    fn kick(&mut self, lurker: &Lurker, channels: &[String], now: i64) -> Vec<Command> {
+    /// WHOIS for a lurker whose grace period is over, to find every channel
+    /// they are in, unless lurker swept them a moment ago or they are
+    /// offline.
+    fn look_up(&mut self, lurker: &Lurker, now: i64) -> Option<Command> {
+        let key = casemap::fold(&lurker.nick);
+        let recent = self
+            .swept
+            .get(&lurker.id)
+            .is_some_and(|&at| now - at < SWEEP_INTERVAL);
+        if self.lookups.contains_key(&key) || recent || !self.is_online(&lurker.nick) {
+            return None;
+        }
+        self.lookups.insert(key, Lookup::default());
+        Some(Command::WHOIS(None, lurker.nick.clone()))
+    }
+
+    /// The WHOIS lurker is collecting for a nick, if it asked for one.
+    fn lookup(&mut self, nick: &str) -> Option<&mut Lookup> {
+        self.lookups.get_mut(&casemap::fold(nick))
+    }
+
+    /// The end of a WHOIS lurker asked for: kicks the lurker from every
+    /// channel they are in, if they are still due.
+    fn looked_up(&mut self, nick: &str, now: i64) -> Vec<Command> {
+        let Some(lookup) = self.lookups.remove(&casemap::fold(nick)) else {
+            return Vec::new();
+        };
+        if !lookup.found {
+            self.online.remove(&casemap::fold(nick));
+            return Vec::new();
+        }
+        let Some(lurker) = log_db(self.db.lurker(nick)).flatten() else {
+            return Vec::new();
+        };
+        if !self.enforceable(&lurker) || lurker.kick_at().is_none_or(|at| at > now) {
+            return Vec::new();
+        }
+        self.sweep(&lurker, &lookup.channels, now)
+    }
+
+    /// Kicks a lurker from every channel but their room, and sajoins them
+    /// into their room if they aren't in it.
+    fn sweep(&mut self, lurker: &Lurker, channels: &[String], now: i64) -> Vec<Command> {
         let room = self.room_channel(lurker.room).to_owned();
+        let (in_room, others): (Vec<&String>, Vec<&String>) = channels
+            .iter()
+            .partition(|channel| casemap::eq(channel, &room));
         let mut commands = Vec::new();
 
-        for channel in channels {
+        for channel in &others {
             let facts = Facts {
                 lurker,
                 room: &room,
@@ -864,56 +1106,79 @@ impl<'a> Session<'a> {
             let reason = self
                 .messages
                 .choose(Kind::Kick, &facts, &mut self.rng, &[])
-                .map(|(_, reason)| reason);
-            commands.push(Command::KICK(channel.clone(), lurker.nick.clone(), reason));
+                .map(|(_, reason)| reason)
+                .unwrap_or_default();
+            commands.push(Command::Raw(
+                "SAKICK".to_owned(),
+                vec![(*channel).clone(), lurker.nick.clone(), reason],
+            ));
             self.presence.remove(channel, &lurker.nick);
         }
-        eprintln!("Kicked {} from {}", lurker.nick, channels.join(", "));
-
-        if !self.presence.contains(&room, &lurker.nick) {
-            commands.push(Command::INVITE(lurker.nick.clone(), room.clone()));
-            self.invited.entry(lurker.id).or_insert_with(|| Invited {
-                at: now,
-                from: channels.to_vec(),
-            });
-            eprintln!("Invited {} to {room}", lurker.nick);
+        if !others.is_empty() {
+            let list: Vec<&str> = others.iter().map(|channel| channel.as_str()).collect();
+            eprintln!("Kicked {} from {}", lurker.nick, list.join(", "));
         }
+
+        if in_room.is_empty() {
+            commands.push(Command::SAJOIN(lurker.nick.clone(), room.clone()));
+            eprintln!("Sajoined {} into {room}", lurker.nick);
+        }
+
+        self.swept.insert(lurker.id, now);
         commands
     }
 
-    /// Notices to admins about lurkers invited to their room at least
-    /// `INVITE_WAIT` seconds ago who haven't joined it.
-    fn ask_for_sajoins(&mut self, lurkers: &[Lurker], now: i64) -> Vec<Command> {
+    /// Someone joined one of lurker's channels. A lurker whose grace period
+    /// is over is kicked straight away, unless it is their own room.
+    fn arrived(&mut self, channel: &str, nick: &str, now: i64) -> Vec<Command> {
+        let Some(lurker) = log_db(self.db.lurker(nick)).flatten() else {
+            return Vec::new();
+        };
+        if self.room_of(channel) == Some(lurker.room) {
+            return Vec::new();
+        }
+        if lurker.kick_at().is_some_and(|at| at <= now) {
+            self.swept.remove(&lurker.id);
+        }
+        self.enforce(now)
+    }
+
+    /// Someone said something in one of lurker's channels. A lurker who
+    /// speaks after their warning is no longer kicked.
+    fn heard(&mut self, channel: &str, nick: &str, now: i64) {
+        let Some(lurker) = log_db(self.db.lurker(nick)).flatten() else {
+            return;
+        };
+        log_db(self.db.set_spoke(lurker.id, now));
+        if lurker.warned_at.is_some() && !lurker.released() {
+            self.swept.remove(&lurker.id);
+            eprintln!("Lurker {nick} spoke in {channel}, so they won't be kicked any more");
+        }
+    }
+
+    /// Gives lurker +o, with SAMODE as an IRC operator, in each channel of
+    /// its that it isn't opped in, other than its rooms.
+    fn op_myself(&mut self, now: i64) -> Vec<Command> {
+        if !self.opered {
+            return Vec::new();
+        }
         let mut commands = Vec::new();
-        let ids: Vec<i64> = self.invited.keys().copied().collect();
-
-        for id in ids {
-            let Some(lurker) = lurkers.iter().find(|lurker| lurker.id == id) else {
-                // Forgotten since
-                self.invited.remove(&id);
-                continue;
-            };
-            let room = self.room_channel(lurker.room).to_owned();
-            if self.presence.contains(&room, &lurker.nick) {
-                self.invited.remove(&id);
+        for channel in self.patrolled() {
+            let key = casemap::fold(&channel);
+            let recent = self
+                .op_asked
+                .get(&key)
+                .is_some_and(|&at| now - at < OP_RETRY);
+            if self.has_op(&channel) || recent {
                 continue;
             }
-            let Some(invited) = self.invited.get(&id) else {
-                continue;
-            };
-            if now - invited.at < INVITE_WAIT {
-                continue;
-            }
-
-            let notice = messages::not_joined(lurker, &room, &invited.from);
-            for admin in &self.settings.config.admins {
-                commands.push(Command::PRIVMSG(admin.nick.clone(), notice.clone()));
-            }
-            eprintln!(
-                "Asked admins to sajoin {}, who hasn't joined {room}",
-                lurker.nick
-            );
-            self.invited.remove(&id);
+            self.op_asked.insert(key, now);
+            eprintln!("Opping myself in {channel}");
+            commands.push(Command::SAMODE(
+                channel,
+                "+o".to_owned(),
+                Some(self.nick.clone()),
+            ));
         }
         commands
     }
@@ -984,11 +1249,11 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Follows a mode change in a channel. Returns true when it let lurker
-    /// kick there.
+    /// Follows a mode change in a channel. Returns true when lurker lost its
+    /// +o there.
     fn mode_changed(&mut self, channel: &str, modes: &[Mode<ChannelMode>]) -> bool {
         let key = casemap::fold(channel);
-        let could_kick = self.can_kick(channel);
+        let had_op = self.has_op(channel);
 
         for mode in modes {
             let (adding, mode, target) = match mode {
@@ -1014,15 +1279,7 @@ impl<'a> Session<'a> {
             );
         }
 
-        let can_kick = self.can_kick(channel);
-        if can_kick != could_kick && self.room_of(channel).is_none() {
-            if can_kick {
-                eprintln!("lurker can now warn and kick lurkers in {channel}");
-            } else {
-                eprintln!("lurker can no longer kick in {channel}");
-            }
-        }
-        can_kick && !could_kick
+        had_op && !self.has_op(channel)
     }
 
     /// Someone is in a room: they joined it, or the list of names had them.
@@ -1038,9 +1295,6 @@ impl<'a> Session<'a> {
                 eprintln!("Lurker {nick}, marked for {theirs}, joined {channel}");
             }
             return None;
-        }
-        if self.invited.remove(&lurker.id).is_some() {
-            eprintln!("Lurker {nick} joined {channel} after being invited");
         }
 
         if log_db(self.db.arrived(lurker.id, now)) != Some(true) {
@@ -1083,8 +1337,7 @@ impl<'a> Session<'a> {
         self.presence.clear(channel);
     }
 
-    /// Logs how many people and lurkers are in a channel, and for a channel
-    /// other than the rooms, whether lurker can kick there.
+    /// Logs how many people and lurkers are in a channel.
     fn log_channel(&self, channel: &str) {
         let lurkers = log_db(self.db.lurkers()).map_or(0, |lurkers| {
             lurkers
@@ -1093,18 +1346,7 @@ impl<'a> Session<'a> {
                 .count()
         });
         let count = self.presence.count(channel);
-        if self.room_of(channel).is_some() {
-            eprintln!("{channel}: {count} people besides lurker, {lurkers} of them lurkers");
-        } else {
-            let kicking = if self.can_kick(channel) {
-                "lurker can warn and kick lurkers here"
-            } else {
-                "lurker needs +h or +o here to warn and kick lurkers"
-            };
-            eprintln!(
-                "{channel}: {count} people besides lurker, {lurkers} of them lurkers; {kicking}"
-            );
-        }
+        eprintln!("{channel}: {count} people besides lurker, {lurkers} of them lurkers");
     }
 
     /// Asks for lurker's nick back when whoever had it quit or changed nick.
@@ -1125,6 +1367,16 @@ impl<'a> Session<'a> {
         channels
     }
 
+    /// The channels admins asked lurker to join, other than its rooms, that
+    /// it is in right now.
+    fn patrolled(&self) -> Vec<String> {
+        log_db(self.db.channels())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|channel| self.joined.contains(&casemap::fold(channel)))
+            .collect()
+    }
+
     fn room_of(&self, channel: &str) -> Option<Room> {
         self.settings.config.rooms.find(channel)
     }
@@ -1133,11 +1385,11 @@ impl<'a> Session<'a> {
         self.settings.config.rooms.channel(room)
     }
 
-    /// Whether lurker has +h or higher in a channel.
-    fn can_kick(&self, channel: &str) -> bool {
+    /// Whether lurker has +o or higher in a channel.
+    fn has_op(&self, channel: &str) -> bool {
         self.status
             .get(&casemap::fold(channel))
-            .is_some_and(|status| status.iter().any(|&s| can_kick_with(s)))
+            .is_some_and(|status| status.iter().any(|&s| is_op(s)))
     }
 
     fn is_lurker(&self, nick: &str) -> bool {
@@ -1163,6 +1415,7 @@ mod tests {
     use std::sync::OnceLock;
 
     use super::*;
+    use crate::config::Oper;
 
     const DAY: i64 = 86_400;
     const HOUR: i64 = 3600;
@@ -1242,6 +1495,44 @@ mod tests {
 
     fn here_since(db: &Db, nick: &str) -> Option<i64> {
         db.lurker(nick).unwrap().unwrap().here_since
+    }
+
+    /// Settings with an IRC operator login.
+    fn oper_settings() -> Settings {
+        let mut settings = Settings::example();
+        settings.config.oper = Some(Oper {
+            name: "lurker".to_owned(),
+            password: "secret".to_owned(),
+        });
+        settings
+    }
+
+    /// A session in both rooms, logged in as an IRC operator.
+    fn opered<'a>(settings: &'a mut Settings, db: &'a Db) -> Session<'a> {
+        let mut session = in_both_rooms(settings, db, "lurker");
+        feed(
+            &mut session,
+            &[":irc.example.net 381 lurker :You are now an IRC operator"],
+        );
+        assert!(session.opered);
+        session
+    }
+
+    /// The channels and nicks of the SAKICKs lurker sends.
+    fn sakicks(sent: &[Command]) -> Vec<(&str, &str)> {
+        sent.iter()
+            .filter_map(|command| match command {
+                Command::Raw(name, args) if name == "SAKICK" => {
+                    assert!(!args[2].is_empty(), "a kick needs a reason");
+                    Some((args[0].as_str(), args[1].as_str()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn whois(nick: &str) -> Command {
+        Command::WHOIS(None, nick.to_owned())
     }
 
     #[test]
@@ -1363,7 +1654,7 @@ mod tests {
         assert_eq!(
             sent,
             [reply(
-                "alice is marked trusted (#purgatory). Kicked from my channels 3 days after \
+                "alice is marked trusted (#purgatory). Kicked from every channel 3 days after \
                  being warned."
             )]
         );
@@ -1445,13 +1736,7 @@ mod tests {
         let mut session = in_both_rooms(&mut settings, &db, "lurker");
 
         let sent = feed(&mut session, &[&format!("{ADMIN} INVITE lurker :#wetfish")]);
-        assert_eq!(
-            sent,
-            [
-                join("#wetfish"),
-                reply("Joining #wetfish. Give me +h or +o there so I can warn and kick lurkers.")
-            ]
-        );
+        assert_eq!(sent, [join("#wetfish"), reply("Joining #wetfish.")]);
         assert_eq!(db.channels().unwrap(), ["#wetfish"]);
         assert_eq!(session.rejoin(), [join("#wetfish")]);
 
@@ -1491,7 +1776,10 @@ mod tests {
         );
         assert_eq!(
             replies(&mut session, "channels"),
-            ["My channels: #music (needs +h or +o)"]
+            [
+                "My channels: #music (not opped). I'm not logged in as an IRC operator, so I \
+                 don't warn or kick anyone."
+            ]
         );
 
         let sent = feed(
@@ -1511,143 +1799,11 @@ mod tests {
         );
         assert_eq!(
             replies(&mut session, "channels"),
-            ["I'm only in my rooms. Invite me to a channel, or send: join <#channel>"]
+            [
+                "I'm only in my rooms. Invite me to a channel, or send: join <#channel>. I'm not \
+                 logged in as an IRC operator, so I don't warn or kick anyone."
+            ]
         );
-    }
-
-    #[test]
-    fn knows_when_it_can_kick() {
-        let mut settings = Settings::example();
-        let db = Db::open_in_memory();
-        let mut session = in_both_rooms(&mut settings, &db, "lurker");
-        in_wetfish(&mut session, &db, "@%", "bob");
-        assert!(session.can_kick("#wetfish"));
-
-        feed(&mut session, &[":op!op@h MODE #wetfish -o lurker"]);
-        assert!(session.can_kick("#wetfish"), "still has +h");
-        feed(&mut session, &[":op!op@h MODE #wetfish -h lurker"]);
-        assert!(!session.can_kick("#wetfish"));
-        feed(&mut session, &[":op!op@h MODE #wetfish +v lurker"]);
-        assert!(!session.can_kick("#wetfish"));
-        feed(&mut session, &[":op!op@h MODE #wetfish +ho lurker bob"]);
-        assert!(session.can_kick("#wetfish"));
-    }
-
-    #[test]
-    fn warns_then_kicks_lurkers_and_invites_them_to_their_room() {
-        let mut settings = Settings::example();
-        let db = Db::open_in_memory();
-        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
-        let mut session = in_both_rooms(&mut settings, &db, "lurker");
-
-        // Joining #wetfish with +o finds bob there and warns him at once
-        db.add_channel("#wetfish", "rachel", 0).unwrap();
-        let sent = feed_at(
-            &mut session,
-            2000,
-            &[
-                ":lurker!lurker@host JOIN #wetfish",
-                ":irc.example.net 353 lurker = #wetfish :@lurker bob carol",
-                ":irc.example.net 366 lurker #wetfish :End of /NAMES list.",
-            ],
-        );
-        let [warning] = sent.as_slice() else {
-            panic!("expected a warning, got {sent:?}");
-        };
-        let (channel, text) = said(warning);
-        assert_eq!(channel, "#wetfish");
-        assert!(text.contains("bob") && text.contains("1 HOUR"), "{text}");
-        assert_eq!(db.lurker("bob").unwrap().unwrap().warned_at, Some(2000));
-
-        // Nothing more until the grace period is over
-        assert!(session.enforce(2000 + HOUR - 1).is_empty());
-        let sent = session.enforce(2000 + HOUR);
-        let [
-            Command::KICK(channel, nick, Some(_)),
-            Command::INVITE(invited, room),
-        ] = sent.as_slice()
-        else {
-            panic!("expected a kick and an invite, got {sent:?}");
-        };
-        assert_eq!((channel.as_str(), nick.as_str()), ("#wetfish", "bob"));
-        assert_eq!((invited.as_str(), room.as_str()), ("bob", "#FBI_watchlist"));
-        assert!(!session.presence.contains("#wetfish", "bob"));
-
-        // Coming back gets bob kicked again straight away
-        let sent = feed_at(&mut session, 2000 + HOUR + 60, &[":bob!~b@h JOIN #wetfish"]);
-        assert!(matches!(sent.first(), Some(Command::KICK(..))), "{sent:?}");
-
-        // Admins hear about it when bob hasn't joined his room
-        assert!(session.enforce(2000 + HOUR + INVITE_WAIT - 1).is_empty());
-        let sent = session.enforce(2000 + HOUR + INVITE_WAIT);
-        assert_eq!(
-            sent,
-            [reply(
-                "bob was kicked from #wetfish for lurking and invited to #FBI_watchlist, but \
-                 hasn't joined it. Sajoin them: /sajoin bob #FBI_watchlist"
-            )]
-        );
-        assert!(session.enforce(2000 + 2 * HOUR).is_empty());
-        assert_eq!(db.lurker("bob").unwrap().unwrap().id, bob);
-    }
-
-    #[test]
-    fn does_not_ask_for_a_sajoin_when_the_lurker_joins() {
-        let mut settings = Settings::example();
-        let db = Db::open_in_memory();
-        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
-        db.set_warned(bob, 0).unwrap();
-        let mut session = in_both_rooms(&mut settings, &db, "lurker");
-        in_wetfish(&mut session, &db, "@", "bob");
-
-        // Warned at 0 with an hour's grace, so kicked from 3600
-        let sent = session.enforce(HOUR);
-        assert!(matches!(sent.last(), Some(Command::INVITE(..))), "{sent:?}");
-
-        let sent = feed_at(&mut session, HOUR + 10, &[":bob!~b@h JOIN #FBI_watchlist"]);
-        assert_eq!(said(&sent[0]).0, "#FBI_watchlist", "a welcome");
-        assert!(session.enforce(HOUR + INVITE_WAIT).is_empty());
-    }
-
-    #[test]
-    fn leaves_lurkers_alone_where_it_cannot_kick_or_without_grace() {
-        let mut settings = Settings::example();
-        let db = Db::open_in_memory();
-        mark(&db, "bob", Room::Watchlist, Some(HOUR));
-        mark(&db, "carol", Room::Purgatory, None);
-        let mut session = in_both_rooms(&mut settings, &db, "lurker");
-
-        in_wetfish(&mut session, &db, "+", "bob carol");
-        assert!(session.enforce(DAY).is_empty());
-        assert_eq!(db.lurker("bob").unwrap().unwrap().warned_at, None);
-
-        // Given +o, it warns bob, but never carol
-        let sent = feed(&mut session, &[":op!op@h MODE #wetfish +o lurker"]);
-        assert_eq!(sent.len(), 1);
-        assert!(said(&sent[0]).1.contains("bob"));
-        assert!(
-            session
-                .enforce(10 * DAY)
-                .iter()
-                .all(|command| match command {
-                    Command::KICK(_, nick, _) => nick == "bob",
-                    _ => true,
-                })
-        );
-    }
-
-    #[test]
-    fn never_kicks_from_its_rooms() {
-        let mut settings = Settings::example();
-        let db = Db::open_in_memory();
-        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
-        db.set_warned(bob, 0).unwrap();
-        let mut session = in_both_rooms(&mut settings, &db, "lurker");
-        feed(
-            &mut session,
-            &[":irc.example.net 353 lurker = #purgatory :@lurker bob"],
-        );
-        assert!(session.enforce(DAY).is_empty());
     }
 
     #[test]
@@ -1882,5 +2038,320 @@ mod tests {
         let mut session = in_both_rooms(&mut settings, &db, "lurker");
         let sent = feed(&mut session, &[":alice!alice@host QUIT :bye"]);
         assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn logs_in_as_an_irc_operator_after_connecting() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let mut session = Session::new(&mut settings, &db, messages());
+        let sent = feed(&mut session, &[":irc.example.net 001 lurker :Welcome"]);
+        assert_eq!(
+            sent,
+            [Command::OPER("lurker".to_owned(), "secret".to_owned())]
+        );
+        assert!(!session.opered);
+
+        feed(
+            &mut session,
+            &[":irc.example.net 381 lurker :You are now an IRC operator"],
+        );
+        assert!(session.opered);
+    }
+
+    #[test]
+    fn does_not_oper_without_a_login() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        let mut session = Session::new(&mut settings, &db, messages());
+        let sent = feed(&mut session, &[":irc.example.net 001 lurker :Welcome"]);
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    #[test]
+    fn tells_admins_when_the_oper_login_fails() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        let sent = feed(
+            &mut session,
+            &[":irc.example.net 491 lurker :Invalid oper credentials"],
+        );
+        assert_eq!(
+            sent,
+            [reply(
+                "I couldn't log in as an IRC operator (Invalid oper credentials), so I can't op \
+                 myself, kick or sajoin lurkers. Check [oper] in lurker.toml and the oper block \
+                 on the IRC server."
+            )]
+        );
+        assert!(!session.opered);
+    }
+
+    #[test]
+    fn does_nothing_to_lurkers_without_being_an_operator() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
+        db.set_warned(bob, 0).unwrap();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        in_wetfish(&mut session, &db, "@", "bob");
+        assert!(session.tick(DAY).is_empty());
+    }
+
+    #[test]
+    fn ops_itself_in_its_channels_but_not_in_a_fight() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let mut session = opered(&mut settings, &db);
+        db.add_channel("#wetfish", "rachel", 0).unwrap();
+
+        let samode = Command::SAMODE(
+            "#wetfish".to_owned(),
+            "+o".to_owned(),
+            Some("lurker".to_owned()),
+        );
+        let sent = feed(
+            &mut session,
+            &[
+                ":lurker!lurker@host JOIN #wetfish",
+                ":irc.example.net 353 lurker = #wetfish :+lurker carol",
+                ":irc.example.net 366 lurker #wetfish :End of /NAMES list.",
+            ],
+        );
+        assert_eq!(sent, std::slice::from_ref(&samode));
+
+        feed(&mut session, &[":irc.example.net MODE #wetfish +o lurker"]);
+        assert!(session.has_op("#wetfish"));
+        assert!(session.op_myself(2000).is_empty());
+
+        // Deopped again: lurker waits before trying again
+        let sent = feed(&mut session, &[":op!op@h MODE #wetfish -o lurker"]);
+        assert!(sent.is_empty(), "{sent:?}");
+        assert_eq!(session.op_myself(1000 + OP_RETRY), [samode]);
+    }
+
+    #[test]
+    fn warns_lurkers_it_sees_in_its_channels() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
+        mark(&db, "carol", Room::Watchlist, None);
+        let mut session = opered(&mut settings, &db);
+        db.add_channel("#wetfish", "rachel", 0).unwrap();
+
+        let sent = feed_at(
+            &mut session,
+            2000,
+            &[
+                ":lurker!lurker@host JOIN #wetfish",
+                ":irc.example.net 353 lurker = #wetfish :@lurker bob carol",
+                ":irc.example.net 366 lurker #wetfish :End of /NAMES list.",
+            ],
+        );
+        let [warning] = sent.as_slice() else {
+            panic!("expected a warning, got {sent:?}");
+        };
+        let (channel, text) = said(warning);
+        assert_eq!(channel, "#wetfish");
+        assert!(text.contains("bob") && text.contains("1 HOUR"), "{text}");
+        assert_eq!(db.lurker("bob").unwrap().unwrap().warned_at, Some(2000));
+        assert_eq!(bob, db.lurker("bob").unwrap().unwrap().id);
+
+        // Only once
+        assert!(session.enforce(2100).is_empty());
+    }
+
+    #[test]
+    fn warns_online_lurkers_elsewhere_privately() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        mark(&db, "bob", Room::Watchlist, Some(HOUR));
+        let mut session = opered(&mut settings, &db);
+
+        assert_eq!(session.tick(2000), [Command::ISON(vec!["bob".to_owned()])]);
+        let sent = feed_at(&mut session, 2000, &[":irc.example.net 303 lurker :"]);
+        assert!(sent.is_empty(), "offline: {sent:?}");
+
+        session.tick(3000);
+        let sent = feed_at(&mut session, 3000, &[":irc.example.net 303 lurker :Bob"]);
+        let [warning] = sent.as_slice() else {
+            panic!("expected a warning, got {sent:?}");
+        };
+        assert_eq!(said(warning).0, "bob");
+        assert_eq!(db.lurker("bob").unwrap().unwrap().warned_at, Some(3000));
+
+        // Nobody to ask about while bob's grace period runs
+        assert!(session.tick(3000 + HOUR - 1).is_empty());
+    }
+
+    #[test]
+    fn kicks_lurkers_from_every_channel_and_sajoins_them() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
+        db.set_warned(bob, 0).unwrap();
+        let mut session = opered(&mut settings, &db);
+
+        session.tick(4000);
+        let sent = feed_at(&mut session, 4000, &[":irc.example.net 303 lurker :bob"]);
+        assert_eq!(sent, [whois("bob")]);
+
+        let sent = feed_at(
+            &mut session,
+            4000,
+            &[
+                ":irc.example.net 311 lurker bob ~b host * :Bob",
+                ":irc.example.net 319 lurker bob :@#wetfish #music",
+                ":irc.example.net 319 lurker bob :&#secret",
+                ":irc.example.net 318 lurker bob :End of /WHOIS list.",
+            ],
+        );
+        assert_eq!(
+            sakicks(&sent),
+            [("#wetfish", "bob"), ("#music", "bob"), ("#secret", "bob")]
+        );
+        assert_eq!(
+            sent.last(),
+            Some(&Command::SAJOIN(
+                "bob".to_owned(),
+                "#FBI_watchlist".to_owned()
+            ))
+        );
+
+        // Looked up again a while later, for channels joined since
+        assert!(session.enforce(4000 + SWEEP_INTERVAL - 1).is_empty());
+        assert_eq!(session.enforce(4000 + SWEEP_INTERVAL), [whois("bob")]);
+    }
+
+    #[test]
+    fn leaves_lurkers_in_their_own_room() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
+        db.set_warned(bob, 0).unwrap();
+        let mut session = opered(&mut settings, &db);
+        feed(
+            &mut session,
+            &[":irc.example.net 353 lurker = #FBI_watchlist :lurker bob"],
+        );
+
+        let sent = session.enforce(4000);
+        assert_eq!(sent, [whois("bob")]);
+        let sent = feed_at(
+            &mut session,
+            4000,
+            &[
+                ":irc.example.net 311 lurker bob ~b host * :Bob",
+                ":irc.example.net 319 lurker bob :#FBI_watchlist #wetfish",
+                ":irc.example.net 318 lurker bob :End of /WHOIS list.",
+            ],
+        );
+        assert_eq!(sakicks(&sent), [("#wetfish", "bob")]);
+        assert_eq!(sent.len(), 1, "no sajoin: {sent:?}");
+    }
+
+    #[test]
+    fn kicks_lurkers_who_join_its_channels_straight_away() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
+        db.set_warned(bob, 0).unwrap();
+        let mut session = opered(&mut settings, &db);
+        in_wetfish(&mut session, &db, "@", "");
+        session.swept.insert(bob, 4000);
+
+        let sent = feed_at(&mut session, 4100, &[":bob!~b@h JOIN #wetfish"]);
+        assert_eq!(sent, [whois("bob")]);
+
+        // Joining their own room is fine
+        session.lookups.clear();
+        session.swept.insert(bob, 4100);
+        let sent = feed_at(&mut session, 4200, &[":bob!~b@h JOIN #FBI_watchlist"]);
+        assert!(
+            sakicks(&sent).is_empty() && !sent.contains(&whois("bob")),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_offline_lurkers_alone() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
+        db.set_warned(bob, 0).unwrap();
+        let mut session = opered(&mut settings, &db);
+
+        session.tick(4000);
+        feed_at(&mut session, 4000, &[":irc.example.net 303 lurker :bob"]);
+        let sent = feed_at(
+            &mut session,
+            4000,
+            &[
+                ":irc.example.net 401 lurker bob :No such nick",
+                ":irc.example.net 318 lurker bob :End of /WHOIS list.",
+            ],
+        );
+        assert!(sent.is_empty(), "{sent:?}");
+        assert!(!session.is_online("bob"));
+    }
+
+    #[test]
+    fn speaking_after_the_warning_stops_the_kicks() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
+        db.set_warned(bob, 0).unwrap();
+        let mut session = opered(&mut settings, &db);
+        in_wetfish(&mut session, &db, "@", "bob");
+        session.lookups.clear();
+
+        feed_at(
+            &mut session,
+            100,
+            &[":bob!~b@h PRIVMSG #wetfish :hi, I'm real"],
+        );
+        assert!(db.lurker("bob").unwrap().unwrap().released());
+        assert!(session.enforce(DAY).is_empty());
+
+        // Marking them again with a grace period starts over with a warning
+        let sent = feed_at(
+            &mut session,
+            DAY,
+            &[&format!("{ADMIN} PRIVMSG lurker :untrusted bob grace=1h")],
+        );
+        let (channel, text) = said(&sent[0]);
+        assert_eq!(channel, "#wetfish");
+        assert!(text.contains("1 HOUR"), "{text}");
+        assert_eq!(said(&sent[1]).0, "rachel");
+    }
+
+    #[test]
+    fn leaves_lurkers_without_a_grace_period_alone() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        mark(&db, "carol", Room::Purgatory, None);
+        let mut session = opered(&mut settings, &db);
+        in_wetfish(&mut session, &db, "@", "carol");
+        assert!(session.tick(DAY).is_empty());
+    }
+
+    #[test]
+    fn reports_its_operator_status() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let mut session = opered(&mut settings, &db);
+        in_wetfish(&mut session, &db, "@", "");
+        assert_eq!(
+            session.channels_report(),
+            "My channels: #wetfish (opped). I'm logged in as an IRC operator, so I warn and \
+             kick lurkers."
+        );
+    }
+
+    #[test]
+    fn reads_channels_from_whois_replies() {
+        let channels: Vec<&str> = whois_channels("@#a %+#b #c ~&#d &#e").collect();
+        assert_eq!(channels, ["#a", "#b", "#c", "#d", "#e"]);
     }
 }
