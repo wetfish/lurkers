@@ -30,7 +30,7 @@ One row per lurker:
 | `grace` | How many seconds after their warning they are kicked, or empty for never |
 | `warned_at` | When lurker warned them, or empty until it does, and again after a new grace period or a move to the other room |
 | `spoke_at` | When lurker last saw them say something, in any channel it is in. After `warned_at`, it stops the kicks. |
-| `invited_at` | When lurker last invited them to their room, or empty if it never has. Lurkers in their room with it empty are kicked from the room and invited back. |
+| `invited_at` | When lurker last invited them to their room, or empty if it never has. Lurkers in their room with it empty are kicked from the room and invited back a minute later. Schema version 7 emptied it for everyone again, after the first invites were withdrawn by the Matrix bridge. |
 
 Older databases had a date for each channel a lurker idled in, in a
 `lurker_channels` table. Upgrading keeps the most recent of each lurker's

@@ -32,7 +32,9 @@ period, wherever they are:
    passes on to Matrix users. If they haven't joined 30 to 60 seconds later,
    it sajoins them there; the log shows which happened. A lurker already in
    their room who was never invited, because lurker sajoined them before it
-   sent invites, is kicked from the room once and invited back.
+   sent invites, is kicked from the room once and invited back a minute
+   later. The wait matters: the bridge withdraws an invite that reaches it
+   before the kick does.
 4. **Release:** a lurker who says something after their warning, in any
    channel lurker is in, isn't kicked any more. Marking them again with
    `grace=` starts over with a new warning.

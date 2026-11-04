@@ -21,8 +21,8 @@ use crate::config::Room;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 6] = [
-    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+const MIGRATIONS: [&str; 7] = [
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
 ];
 
 const SCHEMA_V1: &str = "
@@ -113,6 +113,13 @@ const SCHEMA_V6: &str = "
 -- When lurker last invited them to their room. Empty for everyone at first,
 -- so lurkers sajoined before lurker sent invites are invited too.
 ALTER TABLE lurkers ADD COLUMN invited_at INTEGER;
+";
+
+const SCHEMA_V7: &str = "
+-- The first invites went out at the same moment as the kick from the room,
+-- and the Matrix bridge withdrew them. Empty again, so everyone in their
+-- room is kicked once more and invited back after a wait.
+UPDATE lurkers SET invited_at = NULL;
 ";
 
 /// How often a lurker chatted in the year they were most active.
@@ -658,6 +665,23 @@ mod tests {
 
         db.set_invited(bob.id, 300).unwrap();
         assert_eq!(db.lurker("bob").unwrap().unwrap().invited_at, Some(300));
+    }
+
+    #[test]
+    fn upgrading_a_version_6_database_empties_the_invites() {
+        let conn = Connection::open_in_memory().unwrap();
+        let earlier: String = MIGRATIONS[..6].concat();
+        conn.execute_batch(&format!("{earlier} PRAGMA user_version = 6;"))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO lurkers (nick, nick_key, room, marked_by, marked_at, invited_at)
+             VALUES ('bob', 'bob', 'watchlist', 'rachel', 100, 300)",
+            [],
+        )
+        .unwrap();
+
+        let db = Db::setup(conn).unwrap();
+        assert_eq!(db.lurker("bob").unwrap().unwrap().invited_at, None);
     }
 
     #[test]

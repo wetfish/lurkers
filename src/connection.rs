@@ -74,7 +74,12 @@ const OP_RETRY: i64 = 10 * 60;
 /// tell a client that joins on an invite from a sajoin.
 const INVITE_WAIT: std::ops::RangeInclusive<i64> = 30..=60;
 
-/// How often to check for invited lurkers who are due to be sajoined.
+/// How many seconds lurker waits after kicking a lurker from their room
+/// before inviting them back. The Matrix bridge is slow to pass on the kick,
+/// and withdraws an invite that reaches it before the kick does.
+const REINVITE_DELAY: i64 = 60;
+
+/// How often to check for invites and sajoins that are due.
 const INVITE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The most nicks lurker asks about in one ISON, in bytes.
@@ -194,7 +199,7 @@ async fn serve(
                 Vec::new()
             }
             _ = lurkers.tick() => session.tick(unix_now()),
-            _ = invites.tick() => session.sajoin_due(unix_now()),
+            _ = invites.tick() => session.invites_due(unix_now()),
             () = shutdown.recv() => {
                 quit(client, stream).await;
                 return Ok(());
@@ -307,6 +312,18 @@ fn is_op(status: char) -> bool {
     "qao".contains(status)
 }
 
+/// Removes the entries whose time has come from a map of lurker ids to
+/// times, and returns their ids.
+fn take_due(times: &mut HashMap<i64, i64>, now: i64) -> HashSet<i64> {
+    let due: HashSet<i64> = times
+        .iter()
+        .filter(|&(_, &at)| at <= now)
+        .map(|(&id, _)| id)
+        .collect();
+    times.retain(|id, _| !due.contains(id));
+    due
+}
+
 /// The channels a WHOIS reply lists, without the status prefixes in front
 /// of them, such as `@` in `@#wetfish`. `&` is a status prefix too, so only
 /// `#` starts a channel name.
@@ -366,6 +383,9 @@ struct Session<'a> {
     /// Lurkers invited to their room, by id, with when lurker sajoins them
     /// there unless they join first
     invited: HashMap<i64, i64>,
+    /// Lurkers kicked from their room to be invited back, by id, with when
+    /// lurker invites them
+    reinvite: HashMap<i64, i64>,
 }
 
 impl<'a> Session<'a> {
@@ -391,6 +411,7 @@ impl<'a> Session<'a> {
             swept: HashMap::new(),
             visiting: HashMap::new(),
             invited: HashMap::new(),
+            reinvite: HashMap::new(),
         }
     }
 
@@ -1117,8 +1138,8 @@ impl<'a> Session<'a> {
     /// Kicks a lurker from every channel but their room, and invites them
     /// to their room if they aren't in it. A lurker in their room who was
     /// never invited, because lurker sajoined them there before it sent
-    /// invites, is kicked from it too and invited back, so a Matrix user
-    /// gets the invite.
+    /// invites, is kicked from it too and invited back a minute later, so a
+    /// Matrix user gets the invite.
     fn sweep(&mut self, lurker: &Lurker, channels: &[String], now: i64) -> Vec<Command> {
         let room = self.room_channel(lurker.room).to_owned();
         let (in_room, others): (Vec<&String>, Vec<&String>) = channels
@@ -1158,11 +1179,12 @@ impl<'a> Session<'a> {
                 .unwrap_or_default();
             commands.extend(self.kick(&room, &lurker.nick, reason, now));
             self.presence.remove(&room, &lurker.nick);
+            self.reinvite.insert(lurker.id, now + REINVITE_DELAY);
             eprintln!(
-                "Kicked {} from {room} to invite them back, since they were never invited",
+                "Kicked {} from {room} to invite them back in {REINVITE_DELAY} seconds, since \
+                 they were never invited",
                 lurker.nick
             );
-            commands.extend(self.invite(lurker, &room, now));
         } else if in_room.is_empty() {
             commands.extend(self.invite(lurker, &room, now));
         }
@@ -1179,7 +1201,8 @@ impl<'a> Session<'a> {
     /// Inviting needs +o in the room, so lurker ops itself there first if it
     /// isn't opped. Each invite is recorded in the database.
     fn invite(&mut self, lurker: &Lurker, room: &str, now: i64) -> Vec<Command> {
-        if self.invited.contains_key(&lurker.id) {
+        // Already invited, or waiting to be invited back after a kick
+        if self.invited.contains_key(&lurker.id) || self.reinvite.contains_key(&lurker.id) {
             return Vec::new();
         }
         let mut commands = Vec::new();
@@ -1218,34 +1241,42 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Sajoins invited lurkers who haven't joined their room in time, and
-    /// are still being kicked.
-    fn sajoin_due(&mut self, now: i64) -> Vec<Command> {
-        if !self.invited.values().any(|&at| at <= now) {
+    /// Invites lurkers kicked from their room once their wait is over, and
+    /// sajoins invited lurkers who haven't joined their room in time. Only
+    /// lurkers who are still being kicked are invited or sajoined.
+    fn invites_due(&mut self, now: i64) -> Vec<Command> {
+        let to_invite = take_due(&mut self.reinvite, now);
+        let to_sajoin = take_due(&mut self.invited, now);
+        if to_invite.is_empty() && to_sajoin.is_empty() {
             return Vec::new();
         }
-        let due: HashSet<i64> = self
-            .invited
-            .iter()
-            .filter(|&(_, &at)| at <= now)
-            .map(|(&id, _)| id)
-            .collect();
-        self.invited.retain(|id, _| !due.contains(id));
         let Some(lurkers) = log_db(self.db.lurkers()) else {
             return Vec::new();
         };
 
         let mut commands = Vec::new();
-        for lurker in lurkers.iter().filter(|lurker| due.contains(&lurker.id)) {
+        for lurker in &lurkers {
             let room = self.room_channel(lurker.room).to_owned();
-            if !self.enforceable(lurker) || self.presence.contains(&room, &lurker.nick) {
+            let here = self.presence.contains(&room, &lurker.nick);
+            if !self.enforceable(lurker) {
                 continue;
             }
-            eprintln!(
-                "Sajoined {} into {room}, since they didn't join on the invite",
-                lurker.nick
-            );
-            commands.push(Command::SAJOIN(lurker.nick.clone(), room));
+            if to_invite.contains(&lurker.id) {
+                if here {
+                    // Back in the room already, so there is nothing to invite
+                    // them to
+                    log_db(self.db.set_invited(lurker.id, now));
+                } else {
+                    commands.extend(self.invite(lurker, &room, now));
+                }
+            }
+            if to_sajoin.contains(&lurker.id) && !here {
+                eprintln!(
+                    "Sajoined {} into {room}, since they didn't join on the invite",
+                    lurker.nick
+                );
+                commands.push(Command::SAJOIN(lurker.nick.clone(), room));
+            }
         }
         commands
     }
@@ -2487,15 +2518,15 @@ mod tests {
         );
 
         // Sajoined 30 to 60 seconds later, since bob didn't join
-        assert!(session.sajoin_due(4029).is_empty());
+        assert!(session.invites_due(4029).is_empty());
         assert_eq!(
-            session.sajoin_due(4060),
+            session.invites_due(4060),
             [Command::SAJOIN(
                 "bob".to_owned(),
                 "#FBI_watchlist".to_owned()
             )]
         );
-        assert!(session.sajoin_due(4120).is_empty(), "only once");
+        assert!(session.invites_due(4120).is_empty(), "only once");
 
         // Looked up again a while later, for channels joined since
         assert!(session.enforce(4000 + SWEEP_INTERVAL - 1).is_empty());
@@ -2606,7 +2637,7 @@ mod tests {
 
         feed_at(&mut session, 4020, &[":bob!~b@h JOIN #FBI_watchlist"]);
         assert!(session.invited.is_empty());
-        assert!(session.sajoin_due(4060).is_empty());
+        assert!(session.invites_due(4060).is_empty());
     }
 
     #[test]
@@ -2620,7 +2651,7 @@ mod tests {
         let lurker = db.lurker("bob").unwrap().unwrap();
         session.sweep(&lurker, &[], 4000);
         db.set_spoke(bob, 4010).unwrap();
-        assert!(session.sajoin_due(4060).is_empty());
+        assert!(session.invites_due(4060).is_empty());
         assert!(session.invited.is_empty());
     }
 
@@ -2639,12 +2670,17 @@ mod tests {
         let lurker = db.lurker("bob").unwrap().unwrap();
         assert_eq!(lurker.invited_at, None);
         let sent = session.sweep(&lurker, &["#FBI_watchlist".to_owned()], 4000);
-        assert_eq!(
-            shapes(&sent),
-            ["KICK #FBI_watchlist bob", "INVITE bob #FBI_watchlist"]
-        );
-        assert_eq!(db.lurker("bob").unwrap().unwrap().invited_at, Some(4000));
+        assert_eq!(shapes(&sent), ["KICK #FBI_watchlist bob"]);
         assert!(!session.presence.contains("#FBI_watchlist", "bob"));
+
+        // Invited a minute later, once the bridge has passed the kick on
+        assert!(session.sweep(&lurker, &[], 4010).is_empty(), "not yet");
+        assert!(session.invites_due(4059).is_empty());
+        assert_eq!(
+            shapes(&session.invites_due(4060)),
+            ["INVITE bob #FBI_watchlist"]
+        );
+        assert_eq!(db.lurker("bob").unwrap().unwrap().invited_at, Some(4060));
 
         // Once invited, they are left in the room
         session.invited.clear();
@@ -2686,12 +2722,36 @@ mod tests {
         let sent = session.sweep(&lurker, &["#FBI_watchlist".to_owned()], 5000);
         assert_eq!(
             shapes(&sent),
-            [
-                "SAMODE #FBI_watchlist +o lurker",
-                "KICK #FBI_watchlist bob",
-                "INVITE bob #FBI_watchlist",
-            ]
+            ["SAMODE #FBI_watchlist +o lurker", "KICK #FBI_watchlist bob"]
         );
+        feed(
+            &mut session,
+            &[":irc.example.net MODE #FBI_watchlist +o lurker"],
+        );
+        assert_eq!(
+            shapes(&session.invites_due(5060)),
+            ["INVITE bob #FBI_watchlist"]
+        );
+    }
+
+    #[test]
+    fn does_not_invite_lurkers_back_in_their_room_after_the_kick() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
+        db.set_warned(bob, 0).unwrap();
+        let mut session = opered(&mut settings, &db);
+        feed(
+            &mut session,
+            &[":irc.example.net 353 lurker = #FBI_watchlist :@lurker bob"],
+        );
+
+        let lurker = db.lurker("bob").unwrap().unwrap();
+        session.sweep(&lurker, &["#FBI_watchlist".to_owned()], 4000);
+        feed(&mut session, &[":bob!~b@h JOIN #FBI_watchlist"]);
+        assert!(session.invites_due(4060).is_empty());
+        // Recorded, so they aren't kicked from the room again
+        assert_eq!(db.lurker("bob").unwrap().unwrap().invited_at, Some(4060));
     }
 
     #[test]
