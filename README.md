@@ -51,7 +51,10 @@ after its nick:
 - `activity` and `year`, for trusted lurkers only and always together, say
   how often they chatted in the year they were most active.
 
-[Commands](docs/commands.md) lists every command.
+To remind someone to chat without marking them, put them on the
+[nudge list](docs/commands.md#nudges), such as
+`nudge user=alice for=3w reminders=5`. [Commands](docs/commands.md) lists
+every command.
 
 ## Running lurker
 

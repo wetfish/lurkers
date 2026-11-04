@@ -17,6 +17,9 @@ logs every one.
 | `info <nick>` | Shows everything recorded about a lurker, ending with it all as one command |
 | `list` | Lists the lurkers for each room, marking those in it now with `(here)` |
 | `forget <nick>` | Deletes a lurker |
+| `nudge user=<nick> for=<time> reminders=<number>` | Puts someone on the [nudge list](#nudges) |
+| `nudge list` | Lists who is being nudged, and how the nudges that ended went |
+| `nudge remove user=<nick>` | Takes someone off the nudge list |
 | `poke <nick>` | Sends a lurker in their room their weekly ping now, and schedules the next one a week later |
 | `join <#channel>` | Joins a channel and rejoins it after restarts, the same as inviting lurker there |
 | `part <#channel>` | Leaves a channel for good |
@@ -57,6 +60,31 @@ numbers can come from `wot analyze --nick`.
 `info` ends with everything recorded as one command, such as
 `As one command: untrusted bob grace=3d silent=2026-05-06`, to copy, change
 and send back.
+
+## Nudges
+
+The nudge list is separate from marking lurkers: anyone who isn't a marked
+lurker can be on it, trusted or not, and it never gets them warned or
+kicked. Each nudge has a length and a number of reminders to chat:
+
+```text
+nudge user=alice for=3w reminders=5
+nudge list
+nudge remove user=alice
+```
+
+- `for` is how long the nudge lasts, from 1 hour to 365 days, such as `36h`,
+  `10d` or `3w`.
+- `reminders` is how many reminders lurker sends in that time, from 1 to 20,
+  at least an hour apart.
+- Someone already being nudged has to be removed before being nudged again.
+- Marking someone `trusted` or `untrusted` takes them off the nudge list, and
+  marked lurkers can't be nudged.
+- A nudge follows its nick when they change nick.
+
+`nudge list` shows the nudges going, with how many reminders have been sent,
+and the 20 that ended most recently, with how each went: whether they spoke
+and how long after the first reminder, or why the nudge ended.
 
 ## Channels
 

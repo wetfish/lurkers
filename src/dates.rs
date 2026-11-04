@@ -74,16 +74,7 @@ pub fn parse_grace(input: &str) -> Result<Option<i64>, String> {
         )
     };
 
-    let unit = input.chars().last().ok_or_else(problem)?;
-    let length = match unit.to_ascii_lowercase() {
-        'm' => MINUTE,
-        'h' => HOUR,
-        'd' => DAY,
-        'w' => WEEK,
-        _ => return Err(problem()),
-    };
-    let number: i64 = input[..input.len() - 1].parse().map_err(|_| problem())?;
-    let seconds = number.checked_mul(length).ok_or_else(problem)?;
+    let seconds = seconds(input).ok_or_else(problem)?;
     if !(0..=MAX_GRACE).contains(&seconds) {
         return Err(format!(
             "A grace period must be from 0 to {}.",
@@ -91,6 +82,31 @@ pub fn parse_grace(input: &str) -> Result<Option<i64>, String> {
         ));
     }
     Ok(Some(seconds))
+}
+
+/// A length of time given as minutes, hours, days or weeks, such as `90m`,
+/// `12h`, `3d` or `2w`, in seconds.
+pub fn parse_length(input: &str) -> Result<i64, String> {
+    seconds(input).ok_or_else(|| {
+        format!(
+            "{input} isn't a length of time. Give one in minutes, hours, days or weeks, such as \
+             90m, 12h, 3d or 2w"
+        )
+    })
+}
+
+/// A number followed by `m`, `h`, `d` or `w`, in seconds.
+fn seconds(input: &str) -> Option<i64> {
+    let unit = input.chars().last()?;
+    let length = match unit.to_ascii_lowercase() {
+        'm' => MINUTE,
+        'h' => HOUR,
+        'd' => DAY,
+        'w' => WEEK,
+        _ => return None,
+    };
+    let number: i64 = input[..input.len() - 1].parse().ok()?;
+    number.checked_mul(length).filter(|&seconds| seconds >= 0)
 }
 
 /// A grace period in words, in the largest unit it is a whole number of,
@@ -189,6 +205,15 @@ mod tests {
         assert_eq!(parse_grace("0m"), Ok(Some(0)));
         for input in ["", "3", "d", "3y", "-1d", "400d", "9999999999999w"] {
             assert!(parse_grace(input).is_err(), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn parses_lengths_of_time() {
+        assert_eq!(parse_length("3w"), Ok(3 * WEEK));
+        assert_eq!(parse_length("36H"), Ok(36 * HOUR));
+        for input in ["", "3", "w", "0", "never", "-1d", "3y"] {
+            assert!(parse_length(input).is_err(), "accepted {input:?}");
         }
     }
 

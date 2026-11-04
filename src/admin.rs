@@ -1,13 +1,14 @@
 //! The commands admins send lurker, in private messages or in a channel
-//! after its nick, to mark lurkers and record what they know about them.
-//! `reload`, `poke`, `join`, `part` and `channels` are handled by the
-//! connection, which holds the settings and knows the channels.
+//! after its nick, to mark lurkers and record what they know about them,
+//! and to keep the nudge list. `reload`, `poke`, `join`, `part` and
+//! `channels` are handled by the connection, which holds the settings and
+//! knows the channels.
 
 use chrono::{Datelike, NaiveDate};
 
 use crate::config::{Room, Rooms};
 use crate::dates;
-use crate::db::{Db, Frequency, Lurker, Marked};
+use crate::db::{Db, Frequency, Lurker, Marked, Nudge, NudgeEnd};
 use crate::presence::Presence;
 
 /// Reply lines are cut at about this many bytes, so they fit in one IRC
@@ -15,12 +16,13 @@ use crate::presence::Presence;
 const LINE_LENGTH: usize = 350;
 
 /// Every command's name, including those the connection carries out.
-const COMMANDS: [&str; 11] = [
+const COMMANDS: [&str; 12] = [
     "trusted",
     "untrusted",
     "info",
     "list",
     "forget",
+    "nudge",
     "poke",
     "join",
     "part",
@@ -28,6 +30,24 @@ const COMMANDS: [&str; 11] = [
     "reload",
     "help",
 ];
+
+const HOUR: i64 = 3600;
+const DAY: i64 = 24 * HOUR;
+
+/// The shortest and longest a nudge can last, to catch typos.
+const NUDGE_LENGTHS: std::ops::RangeInclusive<i64> = HOUR..=365 * DAY;
+
+/// The most reminders a nudge can have.
+const MAX_REMINDERS: i64 = 20;
+
+/// How far apart a nudge's reminders must be at least.
+const REMINDER_GAP: i64 = HOUR;
+
+/// How many ended nudges `nudge list` shows, newest first.
+const ENDED_SHOWN: usize = 20;
+
+const NUDGE_USAGE: &str = "Usage: nudge user=<nick> for=<time> reminders=<number>, nudge list, \
+                           or nudge remove user=<nick>";
 
 /// Whether a word is the name of a command, ignoring case.
 pub fn is_command(word: &str) -> bool {
@@ -98,6 +118,7 @@ pub fn run(context: &Context, text: &str) -> Vec<String> {
         "info" => info(context, args),
         "list" => list(context),
         "forget" => forget(context, args),
+        "nudge" => nudge(context, args),
         "help" => Ok(help(context.rooms)),
         _ => Err(Problem::Usage(format!(
             "I don't know the command {command}. Send \"help\" for the list."
@@ -142,6 +163,10 @@ pub fn help(rooms: &Rooms) -> Vec<String> {
         "info <nick>: everything recorded about a lurker".to_owned(),
         "list: every lurker, and who is in their room now".to_owned(),
         "forget <nick>: delete a lurker".to_owned(),
+        "nudge user=<nick> for=<time> reminders=<number>: remind someone to chat, in every \
+         channel they're in, such as nudge user=alice for=3w reminders=5. nudge list: who is \
+         being nudged and how it went. nudge remove user=<nick>: stop"
+            .to_owned(),
         "poke <nick>: send a lurker their weekly ping now".to_owned(),
         "join <#channel>: join a channel and op myself there, to watch for lurkers. Inviting \
          me does the same"
@@ -206,6 +231,14 @@ fn mark(context: &Context, args: &[&str], room: Room) -> Reply {
         first.push_str(&format!(
             " Their time in {channel} starts counting when they join it."
         ));
+    }
+    // Lurkers aren't nudged
+    if context
+        .db
+        .end_nudge(nick, NudgeEnd::Marked, Some(context.admin), context.now)?
+        .is_some()
+    {
+        first.push_str(" Removed from the nudge list.");
     }
 
     Ok(vec![first])
@@ -433,6 +466,230 @@ fn list(context: &Context) -> Reply {
         }
     }
     Ok(lines)
+}
+
+/// `nudge user=… for=… reminders=…`, `nudge list` and `nudge remove
+/// user=…`.
+fn nudge(context: &Context, args: &[&str]) -> Reply {
+    match args
+        .first()
+        .map(|word| word.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("list") if args.len() == 1 => nudge_list(context),
+        Some("remove") => nudge_remove(context, &args[1..]),
+        _ => nudge_add(context, args),
+    }
+}
+
+/// Puts someone on the nudge list.
+fn nudge_add(context: &Context, args: &[&str]) -> Reply {
+    let fields = named(args, &["user", "for", "reminders"])?;
+    let (Some(user), Some(length), Some(reminders)) = (
+        field(&fields, "user"),
+        field(&fields, "for"),
+        field(&fields, "reminders"),
+    ) else {
+        return Err(NUDGE_USAGE.into());
+    };
+    let nick = check_nick(user)?;
+    let length = dates::parse_length(length)?;
+    if !NUDGE_LENGTHS.contains(&length) {
+        return Err(format!(
+            "for must be from 1 hour to {}.",
+            dates::length(*NUDGE_LENGTHS.end())
+        )
+        .into());
+    }
+    let reminders: i64 = reminders
+        .parse()
+        .ok()
+        .filter(|count| (1..=MAX_REMINDERS).contains(count))
+        .ok_or_else(|| format!("Give reminders as a number from 1 to {MAX_REMINDERS}."))?;
+    if length / reminders < REMINDER_GAP {
+        return Err(
+            "Reminders must be at least an hour apart. Give fewer reminders or a longer for=."
+                .into(),
+        );
+    }
+
+    if let Some(lurker) = context.db.lurker(nick)? {
+        return Err(format!(
+            "{} is marked {} ({}), and marked lurkers aren't nudged. Send forget {} first to \
+             nudge them instead.",
+            lurker.nick,
+            trust(lurker.room),
+            context.rooms.channel(lurker.room),
+            lurker.nick
+        )
+        .into());
+    }
+    if let Some(going) = context.db.nudge(nick)? {
+        return Err(format!(
+            "{} is already being nudged: {}. Send nudge remove user={} first to start again.",
+            going.nick,
+            progress(&going),
+            going.nick
+        )
+        .into());
+    }
+
+    context
+        .db
+        .add_nudge(nick, length, reminders, context.admin, context.now)?;
+    let every = if reminders > 1 {
+        format!(", about one every {}", dates::about(length / reminders))
+    } else {
+        String::new()
+    };
+    Ok(vec![format!(
+        "{nick} is on the nudge list: {} over {}{every}, until {}.",
+        count(reminders, "reminder"),
+        dates::length(length),
+        dates::today(context.now + length)
+    )])
+}
+
+/// Takes someone off the nudge list.
+fn nudge_remove(context: &Context, args: &[&str]) -> Reply {
+    let fields = named(args, &["user"])?;
+    let Some(user) = field(&fields, "user") else {
+        return Err("Usage: nudge remove user=<nick>".into());
+    };
+    let nick = check_nick(user)?;
+    match context
+        .db
+        .end_nudge(nick, NudgeEnd::Removed, Some(context.admin), context.now)?
+    {
+        Some(nudge) => Ok(vec![format!(
+            "Stopped nudging {} after {} of {}.",
+            nudge.nick,
+            nudge.sent,
+            count(nudge.reminders, "reminder")
+        )]),
+        None => Ok(vec![format!("{nick} isn't being nudged.")]),
+    }
+}
+
+/// `nudge list`: the nudges going, then the most recent that ended.
+fn nudge_list(context: &Context) -> Reply {
+    let nudges = context.db.nudges()?;
+    let (going, ended): (Vec<&Nudge>, Vec<&Nudge>) =
+        nudges.iter().partition(|nudge| nudge.ended_at.is_none());
+
+    let mut lines = Vec::new();
+    let prefix = format!("Nudging ({}): ", going.len());
+    if going.is_empty() {
+        lines.push(format!("{prefix}nobody"));
+    } else {
+        let items = going
+            .iter()
+            .map(|nudge| {
+                format!(
+                    "{} ({}, added by {})",
+                    nudge.nick,
+                    progress(nudge),
+                    nudge.added_by
+                )
+            })
+            .collect();
+        lines.extend(wrap(&prefix, items));
+    }
+
+    if !ended.is_empty() {
+        let prefix = if ended.len() > ENDED_SHOWN {
+            format!("Ended, newest {ENDED_SHOWN} of {}: ", ended.len())
+        } else {
+            "Ended: ".to_owned()
+        };
+        let items = ended
+            .iter()
+            .take(ENDED_SHOWN)
+            .map(|&nudge| outcome(nudge))
+            .collect();
+        lines.extend(wrap(&prefix, items));
+    }
+    Ok(lines)
+}
+
+/// How far a nudge has got, such as "2 of 5 reminders, until 2026-11-25".
+fn progress(nudge: &Nudge) -> String {
+    format!(
+        "{} of {}, until {}",
+        nudge.sent,
+        count(nudge.reminders, "reminder"),
+        dates::today(nudge.ends_at())
+    )
+}
+
+/// How a nudge that ended went, such as "alice spoke 2 days after the
+/// first reminder (2026-11-20)".
+fn outcome(nudge: &Nudge) -> String {
+    let nick = &nudge.nick;
+    let how = match nudge.ended {
+        Some(NudgeEnd::Spoke) => match (nudge.first_reminder_at, nudge.spoke_at) {
+            (Some(first), Some(spoke)) => format!(
+                "{nick} spoke {} after the first reminder",
+                dates::about(spoke - first)
+            ),
+            _ => format!("{nick} spoke"),
+        },
+        Some(NudgeEnd::Finished) => {
+            format!("{nick}, no reply after {}", count(nudge.sent, "reminder"))
+        }
+        Some(NudgeEnd::Removed) => format!(
+            "{nick}, removed by {} after {} of {}",
+            nudge.ended_by.as_deref().unwrap_or("an admin"),
+            nudge.sent,
+            count(nudge.reminders, "reminder")
+        ),
+        Some(NudgeEnd::Marked) => format!(
+            "{nick}, marked as a lurker by {}",
+            nudge.ended_by.as_deref().unwrap_or("an admin")
+        ),
+        None => format!("{nick} ({})", progress(nudge)),
+    };
+    format!(
+        "{how} ({})",
+        dates::today(nudge.ended_at.unwrap_or(nudge.added_at))
+    )
+}
+
+/// Fields given as `key=value`, by lowercased key, refusing keys not in
+/// `known` and keys given twice.
+fn named<'a>(args: &[&'a str], known: &[&str]) -> Result<Vec<(String, &'a str)>, Problem> {
+    let mut fields: Vec<(String, &str)> = Vec::new();
+    for &arg in args {
+        let Some((key, value)) = arg.split_once('=') else {
+            return Err(format!("{arg} isn't a field. {NUDGE_USAGE}").into());
+        };
+        let key = key.to_ascii_lowercase();
+        if !known.contains(&key.as_str()) {
+            return Err(format!("I don't know the field {key}. {NUDGE_USAGE}").into());
+        }
+        if fields.iter().any(|(seen, _)| *seen == key) {
+            return Err(format!("{key} is given twice.").into());
+        }
+        fields.push((key, value));
+    }
+    Ok(fields)
+}
+
+fn field<'a>(fields: &[(String, &'a str)], key: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| *value)
+}
+
+/// A count and a word for what it counts, such as "1 reminder" or "5
+/// reminders".
+fn count(number: i64, word: &str) -> String {
+    if number == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{number} {word}s")
+    }
 }
 
 fn forget(context: &Context, args: &[&str]) -> Reply {
@@ -973,8 +1230,8 @@ mod tests {
                 "{reply:?}"
             );
         }
-        assert_eq!(fixture.run("help").len(), 12);
-        assert_eq!(fixture.run("").len(), 12);
+        assert_eq!(fixture.run("help").len(), 13);
+        assert_eq!(fixture.run("").len(), 13);
         assert!(
             fixture
                 .run("help")
@@ -985,7 +1242,7 @@ mod tests {
 
     #[test]
     fn knows_its_commands() {
-        for word in ["trusted", "LIST", "Poke", "channels", "help"] {
+        for word in ["trusted", "LIST", "Poke", "channels", "help", "Nudge"] {
             assert!(is_command(word), "{word}");
         }
         for word in ["keeps", "unchannel", "", "lurker"] {
@@ -999,6 +1256,169 @@ mod tests {
                 assert!(is_command(first), "{line}");
             }
         }
+    }
+
+    #[test]
+    fn keeps_the_nudge_list() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            fixture.run("nudge user=alice for=3w reminders=5"),
+            [
+                "alice is on the nudge list: 5 reminders over 21 days, about one every 4 days, \
+                 until 2026-11-23."
+            ]
+        );
+        assert_eq!(
+            fixture.run("NUDGE FOR=1d user=bob REMINDERS=1"),
+            ["bob is on the nudge list: 1 reminder over 1 day, until 2026-11-03."]
+        );
+        assert_eq!(
+            fixture.run("nudge list"),
+            [
+                "Nudging (2): alice (0 of 5 reminders, until 2026-11-23, added by rachel), bob \
+                 (0 of 1 reminder, until 2026-11-03, added by rachel)"
+            ]
+        );
+        assert_eq!(
+            fixture.run("nudge user=Alice for=1w reminders=2"),
+            [
+                "alice is already being nudged: 0 of 5 reminders, until 2026-11-23. Send nudge \
+                 remove user=alice first to start again."
+            ]
+        );
+
+        assert_eq!(
+            fixture.run("nudge remove user=ALICE"),
+            ["Stopped nudging alice after 0 of 5 reminders."]
+        );
+        assert_eq!(
+            fixture.run("nudge remove user=alice"),
+            ["alice isn't being nudged."]
+        );
+        assert_eq!(
+            fixture.run("nudge list"),
+            [
+                "Nudging (1): bob (0 of 1 reminder, until 2026-11-03, added by rachel)",
+                "Ended: alice, removed by rachel after 0 of 5 reminders (2026-11-02)",
+            ]
+        );
+
+        // Nudged again after being removed
+        fixture.run("nudge user=alice for=1w reminders=2");
+        assert_eq!(fixture.run("nudge list")[0].matches("alice").count(), 1);
+    }
+
+    #[test]
+    fn marking_takes_people_off_the_nudge_list() {
+        let fixture = Fixture::new();
+        fixture.run("nudge user=alice for=3w reminders=5");
+        assert_eq!(
+            fixture.run("trusted alice grace=3d"),
+            [
+                "alice is marked trusted (#purgatory). Kicked from every channel 3 days after \
+                 being warned. Their time in #purgatory starts counting when they join it. \
+                 Removed from the nudge list."
+            ]
+        );
+        assert_eq!(
+            fixture.run("nudge list"),
+            [
+                "Nudging (0): nobody",
+                "Ended: alice, marked as a lurker by rachel (2026-11-02)",
+            ]
+        );
+        assert_eq!(
+            fixture.run("nudge user=alice for=3w reminders=5"),
+            [
+                "alice is marked trusted (#purgatory), and marked lurkers aren't nudged. Send \
+                 forget alice first to nudge them instead."
+            ]
+        );
+    }
+
+    #[test]
+    fn nudge_mistakes_change_nothing() {
+        let fixture = Fixture::new();
+        for (command, reply) in [
+            ("nudge", NUDGE_USAGE.to_owned()),
+            ("nudge user=alice", NUDGE_USAGE.to_owned()),
+            ("nudge user=alice for=3w", NUDGE_USAGE.to_owned()),
+            (
+                "nudge user=alice for=soon reminders=5",
+                "soon isn't a length of time. Give one in minutes, hours, days or weeks, such as \
+                 90m, 12h, 3d or 2w"
+                    .to_owned(),
+            ),
+            (
+                "nudge user=alice for=30m reminders=1",
+                "for must be from 1 hour to 365 days.".to_owned(),
+            ),
+            (
+                "nudge user=alice for=3w reminders=0",
+                "Give reminders as a number from 1 to 20.".to_owned(),
+            ),
+            (
+                "nudge user=alice for=3w reminders=five",
+                "Give reminders as a number from 1 to 20.".to_owned(),
+            ),
+            (
+                "nudge user=alice for=3h reminders=5",
+                "Reminders must be at least an hour apart. Give fewer reminders or a longer \
+                 for=."
+                    .to_owned(),
+            ),
+            (
+                "nudge user=alice for=3w reminders=5 user=bob",
+                "user is given twice.".to_owned(),
+            ),
+            (
+                "nudge user=alice for=3w reminders=5 grace=3d",
+                format!("I don't know the field grace. {NUDGE_USAGE}"),
+            ),
+            (
+                "nudge alice for=3w reminders=5",
+                format!("alice isn't a field. {NUDGE_USAGE}"),
+            ),
+            (
+                "nudge user=#wetfish for=3w reminders=5",
+                "#wetfish isn't a nick.".to_owned(),
+            ),
+            ("nudge remove", "Usage: nudge remove user=<nick>".to_owned()),
+            (
+                "nudge remove user=alice for=3w",
+                format!("I don't know the field for. {NUDGE_USAGE}"),
+            ),
+        ] {
+            assert_eq!(fixture.run(command), [reply], "{command}");
+        }
+        assert!(fixture.db.nudges().unwrap().is_empty());
+    }
+
+    #[test]
+    fn says_how_ended_nudges_went() {
+        let mut nudge = Nudge {
+            id: 1,
+            nick: "carol".to_owned(),
+            length: 21 * DAY,
+            reminders: 5,
+            added_by: "rachel".to_owned(),
+            added_at: NOW,
+            sent: 2,
+            first_reminder_at: Some(NOW + DAY),
+            spoke_at: Some(NOW + 3 * DAY),
+            ended_at: Some(NOW + 3 * DAY),
+            ended: Some(NudgeEnd::Spoke),
+            ended_by: None,
+        };
+        assert_eq!(
+            outcome(&nudge),
+            "carol spoke 2 days after the first reminder (2026-11-05)"
+        );
+        nudge.ended = Some(NudgeEnd::Finished);
+        assert_eq!(
+            outcome(&nudge),
+            "carol, no reply after 2 reminders (2026-11-05)"
+        );
     }
 
     #[test]

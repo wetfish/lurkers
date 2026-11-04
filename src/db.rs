@@ -3,7 +3,8 @@
 //!
 //! `lurkers` has one row per marked user. `used_pings` remembers which ping
 //! messages each lurker has heard, and `channels` the channels admins asked
-//! lurker to join besides its rooms. Nobody else is recorded: people who
+//! lurker to join besides its rooms. `nudges` is the nudge list: the people
+//! admins asked lurker to remind to chat, kept after each nudge ends. Nobody else is recorded: people who
 //! aren't marked are left alone.
 //!
 //! Times are whole seconds since 1970 UTC. In `sqlite3`,
@@ -21,8 +22,8 @@ use crate::config::Room;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 7] = [
-    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+const MIGRATIONS: [&str; 8] = [
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
 ];
 
 const SCHEMA_V1: &str = "
@@ -122,6 +123,39 @@ const SCHEMA_V7: &str = "
 UPDATE lurkers SET invited_at = NULL;
 ";
 
+const SCHEMA_V8: &str = "
+-- The nudge list: people admins asked lurker to remind to chat, apart from
+-- the lurkers. A row stays after the nudge ends, so admins can see how it
+-- went.
+CREATE TABLE nudges (
+    id INTEGER PRIMARY KEY,
+    -- The nick the admin gave, updated when lurker sees them change nick.
+    nick TEXT NOT NULL,
+    -- The nick folded with IRC's case mapping, to look them up.
+    nick_key TEXT NOT NULL,
+    -- How many seconds the nudge lasts from added_at, and how many
+    -- reminders lurker sends in that time.
+    length INTEGER NOT NULL,
+    reminders INTEGER NOT NULL,
+    added_by TEXT NOT NULL,
+    added_at INTEGER NOT NULL,
+    -- How many reminders lurker has sent, and when it sent the first and
+    -- the last.
+    sent INTEGER NOT NULL DEFAULT 0,
+    first_reminder_at INTEGER,
+    last_reminder_at INTEGER,
+    -- When lurker first heard them speak after a reminder.
+    spoke_at INTEGER,
+    -- When and why the nudge ended, and the admin who ended it, if one did.
+    ended_at INTEGER,
+    ended TEXT CHECK (ended IN ('spoke', 'finished', 'removed', 'marked')),
+    ended_by TEXT
+);
+
+-- Each nick has at most one nudge going at a time.
+CREATE UNIQUE INDEX nudges_going ON nudges (nick_key) WHERE ended_at IS NULL;
+";
+
 /// How often a lurker chatted in the year they were most active.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Frequency {
@@ -202,6 +236,75 @@ impl Lurker {
         matches!((self.warned_at, self.spoke_at), (Some(warned), Some(spoke)) if spoke > warned)
     }
 }
+
+/// Someone on the nudge list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Nudge {
+    pub id: i64,
+    pub nick: String,
+    /// How many seconds the nudge lasts from when it was added
+    pub length: i64,
+    /// How many reminders lurker sends in that time
+    pub reminders: i64,
+    pub added_by: String,
+    pub added_at: i64,
+    /// How many reminders lurker has sent
+    pub sent: i64,
+    pub first_reminder_at: Option<i64>,
+    /// When lurker first heard them speak after a reminder
+    pub spoke_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub ended: Option<NudgeEnd>,
+    /// The admin who ended the nudge, if one did
+    pub ended_by: Option<String>,
+}
+
+impl Nudge {
+    /// When the nudge is over.
+    pub fn ends_at(&self) -> i64 {
+        self.added_at + self.length
+    }
+}
+
+/// Why a nudge ended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NudgeEnd {
+    /// They spoke after a reminder.
+    Spoke,
+    /// Its time ran out.
+    Finished,
+    /// An admin removed them from the nudge list.
+    Removed,
+    /// An admin marked them as a lurker.
+    Marked,
+}
+
+impl NudgeEnd {
+    const ALL: [NudgeEnd; 4] = [
+        NudgeEnd::Spoke,
+        NudgeEnd::Finished,
+        NudgeEnd::Removed,
+        NudgeEnd::Marked,
+    ];
+
+    /// The word the database stores.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NudgeEnd::Spoke => "spoke",
+            NudgeEnd::Finished => "finished",
+            NudgeEnd::Removed => "removed",
+            NudgeEnd::Marked => "marked",
+        }
+    }
+
+    fn parse(word: &str) -> Option<NudgeEnd> {
+        NudgeEnd::ALL.into_iter().find(|end| end.as_str() == word)
+    }
+}
+
+/// The columns `load_nudge` reads, in order.
+const NUDGE_COLUMNS: &str = "id, nick, length, reminders, added_by, added_at, sent, \
+    first_reminder_at, spoke_at, ended_at, ended, ended_by";
 
 /// What marking someone changed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -490,9 +593,79 @@ impl Db {
         Ok(())
     }
 
-    /// Follows a nick change, if the old nick is a lurker's.
+    /// The nudge going for a nick, if there is one.
+    pub fn nudge(&self, nick: &str) -> rusqlite::Result<Option<Nudge>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {NUDGE_COLUMNS} FROM nudges
+                     WHERE nick_key = ?1 AND ended_at IS NULL"
+                ),
+                [casemap::fold(nick)],
+                load_nudge,
+            )
+            .optional()
+    }
+
+    /// The whole nudge list: those going, by nick, then those that ended,
+    /// newest first.
+    pub fn nudges(&self) -> rusqlite::Result<Vec<Nudge>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {NUDGE_COLUMNS} FROM nudges
+             ORDER BY ended_at IS NOT NULL, ended_at DESC, nick_key, id DESC"
+        ))?;
+        statement.query_map([], load_nudge)?.collect()
+    }
+
+    /// Puts someone on the nudge list. Returns false when they already
+    /// have a nudge going.
+    pub fn add_nudge(
+        &self,
+        nick: &str,
+        length: i64,
+        reminders: i64,
+        admin: &str,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        if self.nudge(nick)?.is_some() {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "INSERT INTO nudges (nick, nick_key, length, reminders, added_by, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![nick, casemap::fold(nick), length, reminders, admin, now],
+        )?;
+        Ok(true)
+    }
+
+    /// Ends the nudge going for a nick, and returns it as it was, or None
+    /// when there was none.
+    pub fn end_nudge(
+        &self,
+        nick: &str,
+        end: NudgeEnd,
+        admin: Option<&str>,
+        now: i64,
+    ) -> rusqlite::Result<Option<Nudge>> {
+        let Some(nudge) = self.nudge(nick)? else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "UPDATE nudges SET ended_at = ?2, ended = ?3, ended_by = ?4 WHERE id = ?1",
+            params![nudge.id, now, end.as_str(), admin],
+        )?;
+        Ok(Some(nudge))
+    }
+
+    /// Follows a nick change, if the old nick is a lurker's. A nudge going
+    /// for the old nick follows it too, unless the new nick has one.
     pub fn rename(&self, old: &str, new: &str) -> rusqlite::Result<NickChange> {
         let (old_key, new_key) = (casemap::fold(old), casemap::fold(new));
+        self.conn.execute(
+            "UPDATE OR IGNORE nudges SET nick = ?2, nick_key = ?3
+             WHERE nick_key = ?1 AND ended_at IS NULL",
+            params![old_key, new, new_key],
+        )?;
         if old_key != new_key && self.lurker(new)?.is_some() {
             return Ok(if self.lurker(old)?.is_some() {
                 NickChange::Taken
@@ -545,6 +718,26 @@ impl Db {
             },
         )
     }
+}
+
+/// A nudge from a row with `NUDGE_COLUMNS`.
+fn load_nudge(row: &rusqlite::Row) -> rusqlite::Result<Nudge> {
+    let ended: Option<String> = row.get(10)?;
+    Ok(Nudge {
+        id: row.get(0)?,
+        nick: row.get(1)?,
+        length: row.get(2)?,
+        reminders: row.get(3)?,
+        added_by: row.get(4)?,
+        added_at: row.get(5)?,
+        sent: row.get(6)?,
+        first_reminder_at: row.get(7)?,
+        spoke_at: row.get(8)?,
+        ended_at: row.get(9)?,
+        // The schema only allows the four reasons
+        ended: ended.as_deref().and_then(NudgeEnd::parse),
+        ended_by: row.get(11)?,
+    })
 }
 
 #[cfg(test)]
@@ -682,6 +875,78 @@ mod tests {
 
         let db = Db::setup(conn).unwrap();
         assert_eq!(db.lurker("bob").unwrap().unwrap().invited_at, None);
+    }
+
+    #[test]
+    fn keeps_the_nudge_list() {
+        let db = Db::open_in_memory();
+        assert!(db.add_nudge("Alice", 1000, 4, "rachel", 100).unwrap());
+        assert!(!db.add_nudge("alice", 2000, 2, "sam", 200).unwrap());
+        assert!(db.add_nudge("bob", 1000, 1, "rachel", 100).unwrap());
+
+        let alice = db.nudge("ALICE").unwrap().unwrap();
+        assert_eq!(
+            (alice.nick.as_str(), alice.length, alice.reminders),
+            ("Alice", 1000, 4)
+        );
+        assert_eq!((alice.sent, alice.ended), (0, None));
+        assert_eq!(alice.ends_at(), 1100);
+
+        let ended = db
+            .end_nudge("alice", NudgeEnd::Removed, Some("sam"), 300)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.id, alice.id);
+        assert_eq!(db.nudge("alice").unwrap(), None);
+        assert_eq!(
+            db.end_nudge("alice", NudgeEnd::Removed, None, 400).unwrap(),
+            None
+        );
+
+        // A new nudge for the same nick, with the old one kept
+        assert!(db.add_nudge("alice", 500, 1, "rachel", 500).unwrap());
+        let list: Vec<(String, Option<NudgeEnd>)> = db
+            .nudges()
+            .unwrap()
+            .into_iter()
+            .map(|nudge| (nudge.nick, nudge.ended))
+            .collect();
+        assert_eq!(
+            list,
+            [
+                ("alice".to_owned(), None),
+                ("bob".to_owned(), None),
+                ("Alice".to_owned(), Some(NudgeEnd::Removed)),
+            ]
+        );
+        let old = &db.nudges().unwrap()[2];
+        assert_eq!(
+            (old.ended_at, old.ended_by.as_deref()),
+            (Some(300), Some("sam"))
+        );
+    }
+
+    #[test]
+    fn nudges_follow_nick_changes() {
+        let db = Db::open_in_memory();
+        db.add_nudge("alice", 1000, 4, "rachel", 100).unwrap();
+        db.add_nudge("bob", 1000, 4, "rachel", 100).unwrap();
+
+        assert_eq!(
+            db.rename("alice", "alice_").unwrap(),
+            NickChange::NotALurker
+        );
+        assert_eq!(db.nudge("alice_").unwrap().unwrap().nick, "alice_");
+        assert_eq!(db.nudge("alice").unwrap(), None);
+
+        // Not onto a nick that has a nudge going
+        db.rename("alice_", "bob").unwrap();
+        assert_eq!(db.nudge("alice_").unwrap().unwrap().nick, "alice_");
+
+        // Ended nudges keep the nick they had
+        db.end_nudge("bob", NudgeEnd::Finished, None, 200).unwrap();
+        db.rename("bob", "bobby").unwrap();
+        assert_eq!(db.nudge("bobby").unwrap(), None);
     }
 
     #[test]

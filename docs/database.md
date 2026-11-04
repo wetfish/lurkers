@@ -43,6 +43,26 @@ they can, by `lurker_id` and `template`: the message's position in its list
 in `messages.toml`, counting from 0. Moving a lurker to the other room
 clears theirs.
 
+## nudges
+
+The nudge list, one row per nudge. A row stays after its nudge ends, so the
+list keeps every nudge and how it went. A nick has at most one nudge going
+at a time.
+
+| Column | Contents |
+| --- | --- |
+| `id` | The nudge's number |
+| `nick`, `nick_key` | The nick, as the admin gave it or as they changed it to, and lowercased with IRC's case mapping |
+| `length` | How many seconds the nudge lasts from `added_at`, from `for=` |
+| `reminders` | How many reminders lurker sends in that time, from `reminders=` |
+| `added_by`, `added_at` | The admin who added the nudge, and when |
+| `sent` | How many reminders lurker has sent |
+| `first_reminder_at`, `last_reminder_at` | When lurker sent the first and the last reminder |
+| `spoke_at` | When lurker first heard them speak after a reminder |
+| `ended_at` | When the nudge ended, or empty while it is going |
+| `ended` | Why it ended: `spoke`, `finished` when its time ran out, `removed` with `nudge remove`, or `marked` as a lurker |
+| `ended_by` | The admin who removed or marked them, for `removed` and `marked` |
+
 ## channels
 
 The channels admins asked lurker to join besides its rooms: `channel_key`
