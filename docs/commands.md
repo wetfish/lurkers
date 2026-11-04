@@ -15,7 +15,7 @@ logs every one.
 | `trusted <nick> <fields>` | Marks or updates a lurker for #purgatory |
 | `untrusted <nick> <fields>` | Marks or updates a lurker for #FBI_watchlist |
 | `info <nick>` | Shows everything recorded about a lurker, ending with it all as one command |
-| `list` | Lists the lurkers for each room, marking those in it now with `(here)` |
+| `list` | Lists the lurkers for each room, quiet longest first, with the days since they last spoke and `(here)` for those in it now. Last spoke is the later of `silent=` and when lurker last heard them; lurkers with neither come last, marked with `*`. |
 | `forget <nick>` | Deletes a lurker |
 | `nudge user=<nick> for=<time> reminders=<number>` | Puts someone on the [nudge list](#nudges) |
 | `nudge list` | Lists who is being nudged, and how the nudges that ended went |

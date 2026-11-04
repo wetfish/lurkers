@@ -161,7 +161,7 @@ pub fn help(rooms: &Rooms) -> Vec<String> {
          often they chatted in the year they were most active"
             .to_owned(),
         "info <nick>: everything recorded about a lurker".to_owned(),
-        "list: every lurker, and who is in their room now".to_owned(),
+        "list: every lurker, quiet longest first, and who is in their room now".to_owned(),
         "forget <nick>: delete a lurker".to_owned(),
         "nudge user=<nick> for=<time> reminders=<number>: remind someone to chat, in every \
          channel they're in, such as nudge user=alice for=3w reminders=5. nudge list: who is \
@@ -439,33 +439,75 @@ fn as_command(lurker: &Lurker) -> String {
     command
 }
 
+/// `list`: the lurkers in each room, quiet longest first, with how many
+/// days since they last spoke. Those with no date for it come after, by
+/// nick, marked with an asterisk that the last line explains.
 fn list(context: &Context) -> Reply {
     let lurkers = context.db.lurkers()?;
+    let today = dates::today(context.now);
     let mut lines = Vec::new();
+    let mut undated = false;
 
     for room in Room::ALL {
-        let nicks: Vec<String> = lurkers
+        let channel = context.rooms.channel(room);
+        let mut in_room: Vec<&Lurker> = lurkers
             .iter()
             .filter(|lurker| lurker.room == room)
+            .collect();
+        // Oldest date first, then those with none; lurkers come by nick, so
+        // ties stay in that order
+        in_room.sort_by_key(|lurker| {
+            let last = last_spoke(lurker);
+            (last.is_none(), last)
+        });
+
+        let items: Vec<String> = in_room
+            .iter()
             .map(|lurker| {
-                if context
-                    .presence
-                    .contains(context.rooms.channel(room), &lurker.nick)
-                {
-                    format!("{} (here)", lurker.nick)
-                } else {
-                    lurker.nick.clone()
+                let here = context.presence.contains(channel, &lurker.nick);
+                match (last_spoke(lurker), here) {
+                    (Some(last), true) => format!(
+                        "{} ({}, here)",
+                        lurker.nick,
+                        dates::days(dates::days_since(last, today))
+                    ),
+                    (Some(last), false) => format!(
+                        "{} ({})",
+                        lurker.nick,
+                        dates::days(dates::days_since(last, today))
+                    ),
+                    (None, true) => format!("{}* (here)", lurker.nick),
+                    (None, false) => format!("{}*", lurker.nick),
                 }
             })
             .collect();
-        let prefix = format!("{} ({}): ", context.rooms.channel(room), nicks.len());
-        if nicks.is_empty() {
+        undated |= in_room.iter().any(|lurker| last_spoke(lurker).is_none());
+
+        let prefix = format!("{channel} ({}): ", items.len());
+        if items.is_empty() {
             lines.push(format!("{prefix}nobody"));
         } else {
-            lines.extend(wrap(&prefix, nicks));
+            lines.extend(wrap(&prefix, items));
         }
     }
+    if undated {
+        lines.push(
+            "* No date for when they last spoke: no silent= and I haven't heard them say \
+             anything. Add one with silent=<date>, such as untrusted bob silent=180d."
+                .to_owned(),
+        );
+    }
     Ok(lines)
+}
+
+/// When a lurker last spoke, as far as anyone knows: the later of the date
+/// admins gave with `silent=` and the day lurker last heard them say
+/// something.
+fn last_spoke(lurker: &Lurker) -> Option<NaiveDate> {
+    [lurker.silent, lurker.spoke_at.map(dates::today)]
+        .into_iter()
+        .flatten()
+        .max()
 }
 
 /// `nudge user=… for=… reminders=…`, `nudge list` and `nudge remove
@@ -1194,8 +1236,35 @@ mod tests {
         assert_eq!(
             fixture.run("list"),
             [
-                "#purgatory (2): alice, carol (here)",
-                "#FBI_watchlist (0): nobody"
+                "#purgatory (2): alice*, carol* (here)",
+                "#FBI_watchlist (0): nobody",
+                "* No date for when they last spoke: no silent= and I haven't heard them say \
+                 anything. Add one with silent=<date>, such as untrusted bob silent=180d.",
+            ]
+        );
+    }
+
+    #[test]
+    fn lists_the_quietest_lurkers_first() {
+        let mut fixture = Fixture::new();
+        fixture.presence.add("#FBI_watchlist", "dave");
+        fixture.run("untrusted bob grace=3d silent=30d");
+        fixture.run("untrusted dave grace=3d silent=2024-11-19");
+        fixture.run("untrusted erin grace=3d silent=700d");
+        fixture.run("untrusted frank grace=3d");
+        fixture.run("trusted alice grace=3d silent=10d");
+
+        // erin's date is the oldest, but she spoke yesterday
+        let erin = fixture.lurker("erin").id;
+        fixture.db.set_spoke(erin, NOW - DAY).unwrap();
+
+        assert_eq!(
+            fixture.run("list"),
+            [
+                "#purgatory (1): alice (10 days)",
+                "#FBI_watchlist (4): dave (713 days, here), bob (30 days), erin (1 day), frank*",
+                "* No date for when they last spoke: no silent= and I haven't heard them say \
+                 anything. Add one with silent=<date>, such as untrusted bob silent=180d.",
             ]
         );
     }
