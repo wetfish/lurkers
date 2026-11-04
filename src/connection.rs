@@ -1022,18 +1022,19 @@ impl<'a> Session<'a> {
         commands
     }
 
-    /// Warns a lurker that they will be kicked: in one of lurker's channels
-    /// they are in, or otherwise in a private message, if they are online.
-    fn warn(&mut self, lurker: &Lurker, now: i64) -> Option<Command> {
-        let target = match self
-            .patrolled()
-            .into_iter()
-            .find(|channel| self.presence.contains(channel, &lurker.nick))
-        {
-            Some(channel) => channel,
-            None if self.is_online(&lurker.nick) => lurker.nick.clone(),
-            None => return None,
-        };
+    /// Warns a lurker that they will be kicked, in a private message so
+    /// nobody else sees it, once they are online. A lurker with a grace
+    /// period of 0 isn't warned: lurker only notes when it found them
+    /// online, and looks them up to kick them straight away.
+    fn warn(&mut self, lurker: &Lurker, now: i64) -> Vec<Command> {
+        if !self.is_online(&lurker.nick) {
+            return Vec::new();
+        }
+        if lurker.grace == Some(0) {
+            log_db(self.db.set_warned(lurker.id, now));
+            eprintln!("Kicking {} without a warning", lurker.nick);
+            return self.look_up(lurker, now).into_iter().collect();
+        }
 
         let room = self.room_channel(lurker.room).to_owned();
         let facts = Facts {
@@ -1041,21 +1042,19 @@ impl<'a> Session<'a> {
             room: &room,
             now,
         };
-        let (_, warning) = self
+        let Some((_, warning)) = self
             .messages
-            .choose(Kind::Warning, &facts, &mut self.rng, &[])?;
-        log_db(self.db.set_warned(lurker.id, now));
-        let place = if target.starts_with(['#', '&']) {
-            format!("in {target}")
-        } else {
-            "in a private message".to_owned()
+            .choose(Kind::Warning, &facts, &mut self.rng, &[])
+        else {
+            return Vec::new();
         };
+        log_db(self.db.set_warned(lurker.id, now));
         eprintln!(
-            "Warned {} {place}; kicked in {}",
+            "Warned {} in a private message; kicked in {}",
             lurker.nick,
             dates::length(lurker.grace.unwrap_or_default())
         );
-        Some(Command::PRIVMSG(target, warning))
+        vec![Command::PRIVMSG(lurker.nick.clone(), warning)]
     }
 
     /// WHOIS for a lurker whose grace period is over, to find every channel
@@ -2225,7 +2224,7 @@ mod tests {
     }
 
     #[test]
-    fn warns_lurkers_it_sees_in_its_channels() {
+    fn warns_lurkers_privately_even_in_its_channels() {
         let mut settings = oper_settings();
         let db = Db::open_in_memory();
         let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
@@ -2245,8 +2244,8 @@ mod tests {
         let [warning] = sent.as_slice() else {
             panic!("expected a warning, got {sent:?}");
         };
-        let (channel, text) = said(warning);
-        assert_eq!(channel, "#wetfish");
+        let (target, text) = said(warning);
+        assert_eq!(target, "bob");
         assert!(text.contains("bob") && text.contains("1 HOUR"), "{text}");
         assert_eq!(db.lurker("bob").unwrap().unwrap().warned_at, Some(2000));
         assert_eq!(bob, db.lurker("bob").unwrap().unwrap().id);
@@ -2276,6 +2275,35 @@ mod tests {
 
         // Nobody to ask about while bob's grace period runs
         assert!(session.tick(3000 + HOUR - 1).is_empty());
+    }
+
+    #[test]
+    fn kicks_lurkers_without_a_warning_with_no_grace_period() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        mark(&db, "bob", Room::Watchlist, Some(0));
+        let mut session = opered(&mut settings, &db);
+
+        assert_eq!(session.tick(2000), [Command::ISON(vec!["bob".to_owned()])]);
+        let sent = feed_at(&mut session, 2000, &[":irc.example.net 303 lurker :bob"]);
+        assert_eq!(sent, [whois("bob")], "no warning, straight to the kicks");
+        assert_eq!(db.lurker("bob").unwrap().unwrap().warned_at, Some(2000));
+
+        let sent = feed_at(
+            &mut session,
+            2000,
+            &[
+                ":irc.example.net 311 lurker bob ~b host * :Bob",
+                ":irc.example.net 319 lurker bob :#anime",
+                ":irc.example.net 318 lurker bob :End of /WHOIS list.",
+            ],
+        );
+        assert_eq!(kicks(&sent), [("#anime", "bob")]);
+        assert!(
+            sent.iter()
+                .all(|command| !matches!(command, Command::PRIVMSG(..))),
+            "{sent:?}"
+        );
     }
 
     #[test]
@@ -2510,8 +2538,8 @@ mod tests {
             DAY,
             &[&format!("{ADMIN} PRIVMSG lurker :untrusted bob grace=1h")],
         );
-        let (channel, text) = said(&sent[0]);
-        assert_eq!(channel, "#wetfish");
+        let (target, text) = said(&sent[0]);
+        assert_eq!(target, "bob");
         assert!(text.contains("1 HOUR"), "{text}");
         assert_eq!(said(&sent[1]).0, "rachel");
     }

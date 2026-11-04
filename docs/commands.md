@@ -28,7 +28,7 @@ order:
 
 | Field | Means |
 | --- | --- |
-| `grace=<time>` | How long after a [warning](how-it-works.md#warnings-and-kicks) lurker kicks them from every channel and sajoins them into their room: such as `90m`, `12h`, `3d` or `2w`, or `never`. Giving it starts their warning over. |
+| `grace=<time>` | How long after a [warning](how-it-works.md#warnings-and-kicks) lurker kicks them from every channel and sajoins them into their room: such as `90m`, `12h`, `3d` or `2w`, `0` to kick them without a warning, or `never`. Giving it starts their warning over. |
 | `silent=<date>` | When they went silent: when they last spoke anywhere, or showed up if they never did |
 | `activity=<daily\|weekly\|monthly>` | How often a trusted lurker chatted in the year they were most active. Given together with `year`. |
 | `year=<year>` | The year a trusted lurker was most active. Given together with `activity`. |

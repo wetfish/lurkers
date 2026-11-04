@@ -44,7 +44,8 @@ after its nick:
 ```
 
 - `grace` is how long after the warning lurker starts kicking them: such as
-  `90m`, `12h`, `3d`, `2w`, or `never`. Someone new needs one.
+  `90m`, `12h`, `3d` or `2w`, `0` to kick them without a warning, or `never`.
+  Someone new needs one.
 - `silent` is when they last spoke anywhere: `YYYY-MM-DD`, or days ago such
   as `180d`.
 - `activity` and `year`, for trusted lurkers only and always together, say

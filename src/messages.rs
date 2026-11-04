@@ -21,7 +21,7 @@ pub enum Kind {
     Ping,
     Welcome,
     Fanfare,
-    /// In a channel lurker can kick from, that the lurker will be kicked
+    /// In a private message, that the lurker will be kicked
     Warning,
     /// The reason given when kicking a lurker
     Kick,

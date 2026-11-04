@@ -111,7 +111,7 @@ pub fn help(rooms: &Rooms) -> Vec<String> {
         ),
         "Fields go in any order, and only the ones given change. grace is how long after a \
          warning I kick them from every channel and sajoin them into their room: 90m, 12h, 3d, \
-         2w or never. Giving it starts the warning over"
+         2w, 0 to kick them without a warning, or never. Giving it starts the warning over"
             .to_owned(),
         "silent is when they last spoke anywhere, or showed up if they never did: YYYY-MM-DD \
          or days ago, such as 180d. activity and year go together, for trusted lurkers: how \
@@ -317,9 +317,21 @@ fn info(context: &Context, args: &[&str]) -> Reply {
     lines.push(match (lurker.grace, lurker.kick_at()) {
         (None, _) => "Kicks: never warned or kicked.".to_owned(),
         _ if lurker.released() => format!(
-            "Kicks: stopped, since they spoke on {} after being warned. A new grace period \
-             starts them again.",
-            dates::today(lurker.spoke_at.unwrap_or_default())
+            "Kicks: stopped, since they spoke on {} after {}. A new grace period starts them \
+             again.",
+            dates::today(lurker.spoke_at.unwrap_or_default()),
+            if lurker.grace == Some(0) {
+                "the kicks started"
+            } else {
+                "being warned"
+            }
+        ),
+        (Some(0), None) => {
+            "Kicks: kicked without a warning the next time I find them online.".to_owned()
+        }
+        (Some(0), Some(_)) => format!(
+            "Kicks: since {warned}, without a warning, kicked from every channel and sajoined \
+             into {channel} whenever they're online."
         ),
         (Some(grace), None) => format!(
             "Kicks: warned the next time I find them online, and kicked {} later.",
@@ -443,6 +455,7 @@ fn silent_since(since: NaiveDate, today: NaiveDate) -> String {
 /// being warned".
 fn kicked(grace: Option<i64>) -> String {
     match grace {
+        Some(0) => "kicked from every channel without a warning".to_owned(),
         Some(grace) => format!(
             "kicked from every channel {} after being warned",
             dates::length(grace)
@@ -659,7 +672,7 @@ mod tests {
             (
                 "trusted bob grace=soon",
                 "soon isn't a grace period. Give one in minutes, hours, days or weeks, such as \
-                 90m, 12h, 3d or 2w, or never",
+                 90m, 12h, 3d or 2w, or 0 or never",
             ),
             (
                 "trusted bob grace=3d activity=daily",
@@ -853,6 +866,42 @@ mod tests {
         assert_eq!(
             info[3],
             "Kicks: warned the next time I find them online, and kicked 1 hour later."
+        );
+    }
+
+    #[test]
+    fn kicks_without_a_warning_with_no_grace_period() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            fixture.run("untrusted bob grace=0"),
+            [
+                "bob is marked untrusted (#FBI_watchlist). Kicked from every channel without a \
+                 warning. Their time in #FBI_watchlist starts counting when they join it."
+            ]
+        );
+        assert_eq!(fixture.lurker("bob").grace, Some(0));
+        let info = fixture.run("info bob");
+        assert_eq!(
+            info[3],
+            "Kicks: kicked without a warning the next time I find them online."
+        );
+        assert_eq!(
+            info.last().unwrap(),
+            "As one command: untrusted bob grace=0"
+        );
+
+        let id = fixture.lurker("bob").id;
+        fixture.db.set_warned(id, NOW - DAY).unwrap();
+        assert_eq!(
+            fixture.run("info bob")[3],
+            "Kicks: since 2026-11-01, without a warning, kicked from every channel and \
+             sajoined into #FBI_watchlist whenever they're online."
+        );
+        fixture.db.set_spoke(id, NOW - 60).unwrap();
+        assert_eq!(
+            fixture.run("info bob")[3],
+            "Kicks: stopped, since they spoke on 2026-11-02 after the kicks started. A new \
+             grace period starts them again."
         );
     }
 

@@ -8,8 +8,8 @@
 # - welcome: one is sent when a lurker first joins their room, never the
 #   same one twice in a row in a room.
 # - fanfare: one is sent when a lurker speaks, at most once a day.
-# - warning: sent once, in a channel lurker can kick from, to say the lurker
-#   will be kicked to their room after their grace period.
+# - warning: sent once, in a private message, to say the lurker will be
+#   kicked to their room after their grace period.
 # - kick: the reason given when lurker kicks a lurker from a channel.
 #
 # Placeholders in braces are filled in for the lurker. A message is only used

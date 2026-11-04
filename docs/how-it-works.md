@@ -17,8 +17,9 @@ period, wherever they are:
 
 1. **Warning:** as soon as lurker finds them online, which it checks every
    minute, it warns them in the voice of their room that it will take them
-   there after their grace period. It warns them in one of its channels if
-   they are in one, and otherwise in a private message.
+   there after their grace period. It warns them in a private message, so
+   nobody else sees it. With `grace=0`, it skips the warning and kicks them
+   straight away.
 2. **Kicks:** once the grace period after the warning is over, lurker kicks
    them from every channel they are in apart from their room, including
    secret ones, then sajoins them into their room. It kicks as a channel op,

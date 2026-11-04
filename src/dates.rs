@@ -58,15 +58,19 @@ pub fn days(count: i64) -> String {
 }
 
 /// A grace period given as minutes, hours, days or weeks, such as `90m`,
-/// `12h`, `3d` or `2w`, in seconds, or None for `never`.
+/// `12h`, `3d` or `2w`, in seconds, or None for `never`. `0` means kicked
+/// without a warning.
 pub fn parse_grace(input: &str) -> Result<Option<i64>, String> {
     if input.eq_ignore_ascii_case("never") {
         return Ok(None);
     }
+    if input == "0" {
+        return Ok(Some(0));
+    }
     let problem = || {
         format!(
             "{input} isn't a grace period. Give one in minutes, hours, days or weeks, such as \
-             90m, 12h, 3d or 2w, or never"
+             90m, 12h, 3d or 2w, or 0 or never"
         )
     };
 
@@ -80,9 +84,9 @@ pub fn parse_grace(input: &str) -> Result<Option<i64>, String> {
     };
     let number: i64 = input[..input.len() - 1].parse().map_err(|_| problem())?;
     let seconds = number.checked_mul(length).ok_or_else(problem)?;
-    if !(MINUTE..=MAX_GRACE).contains(&seconds) {
+    if !(0..=MAX_GRACE).contains(&seconds) {
         return Err(format!(
-            "A grace period must be from 1m to {}.",
+            "A grace period must be from 0 to {}.",
             days(MAX_GRACE / DAY)
         ));
     }
@@ -102,9 +106,11 @@ pub fn length(seconds: i64) -> String {
 }
 
 /// A grace period as admins type it, in the largest of days, hours and
-/// minutes it is a whole number of, such as `3d`, `12h` or `90m`.
+/// minutes it is a whole number of, such as `3d`, `12h` or `90m`, or `0`.
 pub fn short(seconds: i64) -> String {
-    if seconds % DAY == 0 {
+    if seconds == 0 {
+        "0".to_owned()
+    } else if seconds % DAY == 0 {
         format!("{}d", seconds / DAY)
     } else if seconds % HOUR == 0 {
         format!("{}h", seconds / HOUR)
@@ -179,7 +185,9 @@ mod tests {
         assert_eq!(parse_grace("3d"), Ok(Some(3 * DAY)));
         assert_eq!(parse_grace("2w"), Ok(Some(2 * WEEK)));
         assert_eq!(parse_grace("Never"), Ok(None));
-        for input in ["", "3", "d", "0m", "3y", "-1d", "400d", "9999999999999w"] {
+        assert_eq!(parse_grace("0"), Ok(Some(0)));
+        assert_eq!(parse_grace("0m"), Ok(Some(0)));
+        for input in ["", "3", "d", "3y", "-1d", "400d", "9999999999999w"] {
             assert!(parse_grace(input).is_err(), "accepted {input:?}");
         }
     }
@@ -190,7 +198,8 @@ mod tests {
         assert_eq!(short(2 * WEEK), "14d");
         assert_eq!(short(HOUR), "1h");
         assert_eq!(short(90 * MINUTE), "90m");
-        for seconds in [MINUTE, 90 * MINUTE, 12 * HOUR, 3 * DAY, 2 * WEEK] {
+        assert_eq!(short(0), "0");
+        for seconds in [0, MINUTE, 90 * MINUTE, 12 * HOUR, 3 * DAY, 2 * WEEK] {
             assert_eq!(parse_grace(&short(seconds)), Ok(Some(seconds)));
         }
     }
