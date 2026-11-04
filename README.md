@@ -23,8 +23,8 @@ runs at `lurkers.wetfish.net`.
 1. An admin marks someone, such as `untrusted bob grace=3d silent=180d`.
 2. The next time bob is online, lurker warns him.
 3. Once his grace period of 3 days is over, lurker kicks him from every
-   channel and sajoins him into #FBI_watchlist, again whenever he settles
-   somewhere else.
+   channel and invites him to #FBI_watchlist, sajoining him there if he
+   doesn't join. It kicks him again whenever he settles somewhere else.
 4. In the room, lurker welcomes him and pings him about once a week.
 5. When he says anything, lurker makes a fuss, tells the admins, and stops
    kicking him.

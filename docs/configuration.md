@@ -85,7 +85,7 @@ nothing more:
 | Needed | For |
 | --- | --- |
 | `SAJOIN` and `users/sajoin-others` | Sajoining lurkers into their room, and itself into any channel a lurker is in, past bans, keys and invite-only, to kick them there |
-| `SAMODE` | Giving itself +o in its channels, and wherever it kicks a lurker |
+| `SAMODE` | Giving itself +o in its rooms and channels, and wherever it kicks a lurker |
 | `users/channel-spy` | Seeing a lurker's secret and private channels, so it kicks them from those too |
 | `channels/auspex` | Seeing everyone in `+u` (auditorium) channels |
 

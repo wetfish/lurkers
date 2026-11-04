@@ -22,13 +22,18 @@ period, wherever they are:
    straight away.
 2. **Kicks:** once the grace period after the warning is over, lurker kicks
    them from every channel they are in apart from their room, including
-   secret ones, then sajoins them into their room. It kicks as a channel op,
-   so the Matrix bridge also removes Matrix users from the matching room,
-   which it doesn't for a SAKICK. In a channel it isn't in, it sajoins
-   itself, ops itself, kicks and leaves again. It does this again every 5
-   minutes while they are online, and straight away when they join one of
-   lurker's channels, so they can't settle anywhere else.
-3. **Release:** a lurker who says something after their warning, in any
+   secret ones. It kicks as a channel op, so the Matrix bridge also removes
+   Matrix users from the matching room, which it doesn't for a SAKICK. In a
+   channel it isn't in, it sajoins itself, ops itself, kicks and leaves
+   again. It does this again every 5 minutes while they are online, and
+   straight away when they join one of lurker's channels, so they can't
+   settle anywhere else.
+3. **Invite:** lurker then invites them to their room, which the bridge
+   passes on to Matrix users. If they haven't joined 30 to 60 seconds later,
+   it sajoins them there; the log shows which happened. A lurker already in
+   their room who was never invited, because lurker sajoined them before it
+   sent invites, is kicked from the room once and invited back.
+4. **Release:** a lurker who says something after their warning, in any
    channel lurker is in, isn't kicked any more. Marking them again with
    `grace=` starts over with a new warning.
 
@@ -72,10 +77,10 @@ to](commands.md#channels), and rejoins any it isn't in every minute, such as
 after a kick or a ban.
 
 As an IRC operator, lurker gives itself +o with SAMODE in each of these
-channels where it isn't opped, but not in its rooms. If someone takes +o
-away, it waits 10 minutes before taking it back, so it never fights anyone
-over it. To kick a lurker where it isn't opped, it ops itself first, and
-keeps +o afterwards everywhere but its rooms.
+channels and in its rooms, where it needs +o to invite lurkers. If someone
+takes +o away, it waits 10 minutes before taking it back, so it never fights
+anyone over it. To kick or invite a lurker where it isn't opped, it ops
+itself first.
 
 ## Staying connected
 

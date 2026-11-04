@@ -414,6 +414,7 @@ mod tests {
             grace: Some(3 * DAY),
             warned_at: None,
             spoke_at: None,
+            invited_at: None,
         }
     }
 

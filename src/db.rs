@@ -21,7 +21,9 @@ use crate::config::Room;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 5] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
+const MIGRATIONS: [&str; 6] = [
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE lurkers (
@@ -107,6 +109,12 @@ UPDATE lurkers SET silent_since =
 DROP TABLE lurker_channels;
 ";
 
+const SCHEMA_V6: &str = "
+-- When lurker last invited them to their room. Empty for everyone at first,
+-- so lurkers sajoined before lurker sent invites are invited too.
+ALTER TABLE lurkers ADD COLUMN invited_at INTEGER;
+";
+
 /// How often a lurker chatted in the year they were most active.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Frequency {
@@ -170,6 +178,8 @@ pub struct Lurker {
     pub warned_at: Option<i64>,
     /// When lurker last saw them say something, in any channel it is in
     pub spoke_at: Option<i64>,
+    /// When lurker last invited them to their room
+    pub invited_at: Option<i64>,
 }
 
 impl Lurker {
@@ -413,6 +423,15 @@ impl Db {
         Ok(())
     }
 
+    /// Records that lurker invited a lurker to their room.
+    pub fn set_invited(&self, id: i64, at: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE lurkers SET invited_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
     /// Records that lurker warned a lurker.
     pub fn set_warned(&self, id: i64, at: i64) -> rusqlite::Result<()> {
         self.conn.execute(
@@ -489,7 +508,8 @@ impl Db {
     fn load(&self, id: i64) -> rusqlite::Result<Lurker> {
         self.conn.query_row(
             "SELECT nick, room, peak_year, peak_frequency, here_since, marked_by, marked_at,
-                    next_ping_at, fanfare_at, grace, warned_at, spoke_at, silent_since
+                    next_ping_at, fanfare_at, grace, warned_at, spoke_at, silent_since,
+                    invited_at
              FROM lurkers WHERE id = ?1",
             [id],
             |row| {
@@ -513,6 +533,7 @@ impl Db {
                     grace: row.get(9)?,
                     warned_at: row.get(10)?,
                     spoke_at: row.get(11)?,
+                    invited_at: row.get(13)?,
                 })
             },
         )
@@ -616,6 +637,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 0);
+    }
+
+    #[test]
+    fn upgrades_a_version_5_database_with_nobody_invited() {
+        let conn = Connection::open_in_memory().unwrap();
+        let earlier: String = MIGRATIONS[..5].concat();
+        conn.execute_batch(&format!("{earlier} PRAGMA user_version = 5;"))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO lurkers (nick, nick_key, room, marked_by, marked_at, here_since)
+             VALUES ('bob', 'bob', 'watchlist', 'rachel', 100, 200)",
+            [],
+        )
+        .unwrap();
+
+        let db = Db::setup(conn).unwrap();
+        let bob = db.lurker("bob").unwrap().unwrap();
+        assert_eq!((bob.here_since, bob.invited_at), (Some(200), None));
+
+        db.set_invited(bob.id, 300).unwrap();
+        assert_eq!(db.lurker("bob").unwrap().unwrap().invited_at, Some(300));
     }
 
     #[test]
