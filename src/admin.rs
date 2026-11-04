@@ -14,6 +14,28 @@ use crate::presence::Presence;
 /// message with room to spare.
 const LINE_LENGTH: usize = 350;
 
+/// Every command's name, including those the connection carries out.
+const COMMANDS: [&str; 11] = [
+    "trusted",
+    "untrusted",
+    "info",
+    "list",
+    "forget",
+    "poke",
+    "join",
+    "part",
+    "channels",
+    "reload",
+    "help",
+];
+
+/// Whether a word is the name of a command, ignoring case.
+pub fn is_command(word: &str) -> bool {
+    COMMANDS
+        .iter()
+        .any(|command| command.eq_ignore_ascii_case(word))
+}
+
 /// What a command needs to know.
 pub struct Context<'a> {
     pub db: &'a Db,
@@ -959,6 +981,24 @@ mod tests {
                 .iter()
                 .all(|line| line.len() <= LINE_LENGTH)
         );
+    }
+
+    #[test]
+    fn knows_its_commands() {
+        for word in ["trusted", "LIST", "Poke", "channels", "help"] {
+            assert!(is_command(word), "{word}");
+        }
+        for word in ["keeps", "unchannel", "", "lurker"] {
+            assert!(!is_command(word), "{word}");
+        }
+        // Every command help lists is known
+        let fixture = Fixture::new();
+        for line in fixture.run("help") {
+            let first = line.split([' ', ':']).next().unwrap();
+            if line.contains(": ") && !line.starts_with("Fields") && !line.starts_with("silent") {
+                assert!(is_command(first), "{line}");
+            }
+        }
     }
 
     #[test]

@@ -3,7 +3,10 @@
 Admins send commands to lurker in a private message, such as
 `/msg lurker list`, or in any channel lurker is in after its nick, such as
 `lurker: list`, `lurker, list` or `lurker list`. lurker answers in the same
-place, so in a channel everyone there sees the answer. Only the
+place, so in a channel everyone there sees the answer. In a channel, lurker
+only answers its commands: a message that starts with its nick but not a
+command, such as `lurker keeps track of everyone`, gets no reply. In a
+private message, it says when it doesn't know a command. Only the
 [admins in the settings](configuration.md#admins) can use them, and lurker
 logs every one.
 

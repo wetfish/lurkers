@@ -674,10 +674,11 @@ impl<'a> Session<'a> {
         commands
     }
 
-    /// A message in a channel. An admin starting it with lurker's nick gives
-    /// a command, answered in the channel. Otherwise it may be a lurker
-    /// speaking, which stops their kicks, and in their room plays the
-    /// fanfare.
+    /// A message in a channel. An admin starting it with lurker's nick and a
+    /// command's name gives a command, answered in the channel. Anything
+    /// else after lurker's nick is ordinary chat and gets no reply. A
+    /// message may also be a lurker speaking, which stops their kicks, and
+    /// in their room plays the fanfare.
     fn channel_message(
         &mut self,
         message: &Message,
@@ -686,6 +687,10 @@ impl<'a> Session<'a> {
         now: i64,
     ) -> Vec<Command> {
         if let Some(command) = self.addressed(text)
+            && command
+                .split_whitespace()
+                .next()
+                .is_some_and(admin::is_command)
             && let Some(nick) = self.admin_nick(message)
         {
             let (mut commands, lines) = self.command(&nick, command, now);
@@ -1925,17 +1930,37 @@ mod tests {
         }
         assert_eq!(db.lurker("bob").unwrap(), None);
 
-        // Not from someone who isn't an admin, and not without lurker's nick
+        // Not from someone who isn't an admin, not without lurker's nick, and
+        // not chat that happens to start with it
         let sent = feed(
             &mut session,
             &[
                 ":mallory!~m@h PRIVMSG #purgatory :lurker: untrusted bob grace=1h",
                 &format!("{ADMIN} PRIVMSG #purgatory :lurkers are untrusted"),
                 &format!("{ADMIN} PRIVMSG #purgatory :untrusted bob grace=1h"),
+                &format!(
+                    "{ADMIN} PRIVMSG #purgatory :lurker keeps track of how long people are in \
+                     purgatory"
+                ),
+                &format!("{ADMIN} PRIVMSG #purgatory :lurker: unchannel bob #wetfish"),
+                &format!("{ADMIN} PRIVMSG #purgatory :lurker:"),
             ],
         );
         assert!(sent.is_empty(), "{sent:?}");
         assert_eq!(db.lurker("bob").unwrap(), None);
+    }
+
+    #[test]
+    fn explains_unknown_commands_only_in_private() {
+        let mut settings = Settings::example();
+        let db = Db::open_in_memory();
+        let mut session = in_both_rooms(&mut settings, &db, "lurker");
+        let sent = feed(&mut session, &[&format!("{ADMIN} PRIVMSG lurker :keeps")]);
+        let [reply] = sent.as_slice() else {
+            panic!("expected one reply, got {sent:?}");
+        };
+        assert_eq!(said(reply).0, "rachel");
+        assert!(said(reply).1.starts_with("I don't know the command"));
     }
 
     #[test]
