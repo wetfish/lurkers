@@ -62,8 +62,8 @@ The commands run as root on the server, in `/srv/wetfish-server`.
    ```
 
    And lurker's IRC operator login, from its oper block on the IRC server
-   (see "IRC operator" in the README), without which it warns and kicks
-   nobody:
+   (see [IRC operator](configuration.md#irc-operator)), without which it
+   warns and kicks nobody:
 
    ```toml
    [oper]

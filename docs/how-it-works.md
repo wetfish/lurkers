@@ -1,0 +1,80 @@
+# How lurker works
+
+lurker only pays attention to the lurkers admins mark with
+[`trusted` or `untrusted`](commands.md#marking-lurkers). Anyone else, such
+as people curious about what happens in the rooms, is left alone and never
+recorded.
+
+A lurker is known by their nick, ignoring case. When lurker sees a lurker
+change nick, it follows them to the new one. Someone who comes back under
+another nick, such as `rachel_` after a dropped connection, isn't recognized
+until they change back or an admin marks the new nick.
+
+## Warnings and kicks
+
+As an IRC operator, lurker deals with every marked lurker who has a grace
+period, wherever they are:
+
+1. **Warning:** as soon as lurker finds them online, which it checks every
+   minute, it warns them in the voice of their room that it will take them
+   there after their grace period. It warns them in one of its channels if
+   they are in one, and otherwise in a private message.
+2. **Kicks:** once the grace period after the warning is over, lurker kicks
+   them, with SAKICK, from every channel they are in apart from their room,
+   including secret ones, then sajoins them into their room. It does this
+   again every 5 minutes while they are online, and straight away when they
+   join one of lurker's channels, so they can't settle anywhere else.
+3. **Release:** a lurker who says something after their warning, in any
+   channel lurker is in, isn't kicked any more. Marking them again with
+   `grace=` starts over with a new warning.
+
+Lurkers with `grace=never` are never warned or kicked. `info <nick>` says
+where a lurker is in this. lurker logs every warning, kick and sajoin.
+
+Without an [IRC operator login](configuration.md#irc-operator), lurker warns
+and kicks nobody. When the server refuses the login, lurker tells every
+admin who is online.
+
+## In the rooms
+
+lurker talks to lurkers in their own room only:
+
+- **Welcome:** the first time a lurker joins their room after being marked,
+  lurker welcomes them, to explain where they are. A lurker who was already
+  there isn't welcomed. Their time in the room starts when lurker first sees
+  them in it.
+- **Pings:** about once a week, each lurker gets a ping. The first comes 3 to
+  7 days after they join their room, or within a week for someone who was
+  already there, and the rest 7 to 9 days apart. A lurker who isn't in the
+  room when one comes due gets it once they are back. Pings in the same room
+  are at least 20 minutes apart, so a full room is never flooded.
+- **Fanfare:** when a lurker speaks in their room, including with `/me`,
+  lurker makes a fuss and sends every admin a notice. After that it stays
+  quiet about them for a day.
+
+The notice looks like this. Admins who aren't online miss it:
+
+```text
+#purgatory: alice spoke after 41 days in the room (silent 348 days): "hello? is anyone here"
+#purgatory: carol spoke after 3 days in the room (no notes recorded): "hey"
+```
+
+What lurker says is in `messages.toml`; see [Messages](messages.md).
+
+## Its channels
+
+lurker joins its two rooms and the [channels admins invite it
+to](commands.md#channels), and rejoins any it isn't in every minute, such as
+after a kick or a ban.
+
+As an IRC operator, lurker gives itself +o with SAMODE in each of these
+channels where it isn't opped, but not in its rooms. If someone takes +o
+away, it waits 10 minutes before taking it back, so it never fights anyone
+over it.
+
+## Staying connected
+
+When its nick is taken, lurker connects as `lurker_` and takes its nick back
+once it is free. When the connection drops, it reconnects, waiting longer
+after each failed attempt, up to 5 minutes. When it is stopped, it quits
+with "brb, getting a software update".

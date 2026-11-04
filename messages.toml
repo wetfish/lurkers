@@ -15,7 +15,7 @@
 # when everything it needs is recorded about them, so lurkers without notes
 # only get the messages that need none. Times are in days unless a unit is
 # named after a colon, as in {idle:seconds}; {idle:silly} picks a unit at
-# random. README.md lists the placeholders and units.
+# random. docs/messages.md lists the placeholders and units.
 
 # #purgatory: sad, apologetic and nostalgic.
 [purgatory]

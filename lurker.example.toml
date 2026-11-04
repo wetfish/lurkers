@@ -35,10 +35,10 @@ path = "lurker.sqlite"
 #listen = "127.0.0.1:8080"
 
 # lurker's IRC operator login, from an oper block on the IRC server; see
-# "IRC operator" in README.md. With it, lurker ops itself in its channels,
-# warns marked lurkers, and once their grace period is over kicks them from
-# every channel and sajoins them into their room. Without it, lurker warns
-# and kicks nobody.
+# "IRC operator" in docs/configuration.md. With it, lurker ops itself in its
+# channels, warns marked lurkers, and once their grace period is over kicks
+# them from every channel and sajoins them into their room. Without it,
+# lurker warns and kicks nobody.
 #[oper]
 #name = "lurker"
 #password = "the password the oper block's hash was made from"
