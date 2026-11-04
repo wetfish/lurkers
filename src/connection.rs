@@ -5,7 +5,9 @@
 //! way it follows who is in its channels, answers admins, and deals with
 //! lurkers: a welcome when they first join their room, fanfare when they
 //! speak, a ping about once a week, and, as an IRC operator, a warning and
-//! then kicks from every channel and a sajoin into their room.
+//! then kicks from every channel and a sajoin into their room. lurker kicks
+//! as a channel op rather than with SAKICK, since the Matrix bridge only
+//! removes a Matrix user from the matching room for a kick by a user.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -346,6 +348,9 @@ struct Session<'a> {
     lookups: HashMap<String, Lookup>,
     /// When lurker last kicked each lurker from their channels, by id
     swept: HashMap<i64, i64>,
+    /// Channels lurker sajoined itself into to kick someone, folded, with
+    /// how many times it is still to leave each
+    visiting: HashMap<String, usize>,
 }
 
 impl<'a> Session<'a> {
@@ -369,6 +374,7 @@ impl<'a> Session<'a> {
             ison: VecDeque::new(),
             lookups: HashMap::new(),
             swept: HashMap::new(),
+            visiting: HashMap::new(),
         }
     }
 
@@ -1112,10 +1118,7 @@ impl<'a> Session<'a> {
                 .choose(Kind::Kick, &facts, &mut self.rng, &[])
                 .map(|(_, reason)| reason)
                 .unwrap_or_default();
-            commands.push(Command::Raw(
-                "SAKICK".to_owned(),
-                vec![(*channel).clone(), lurker.nick.clone(), reason],
-            ));
+            commands.extend(self.kick(channel, &lurker.nick, reason));
             self.presence.remove(channel, &lurker.nick);
         }
         if !others.is_empty() {
@@ -1129,6 +1132,46 @@ impl<'a> Session<'a> {
         }
 
         self.swept.insert(lurker.id, now);
+        commands
+    }
+
+    /// The commands that kick someone from a channel as a channel op. The
+    /// Matrix bridge removes a Matrix user from the matching room for a kick
+    /// by a user, but not for a SAKICK, which comes from the server.
+    ///
+    /// In a channel lurker isn't in, it sajoins itself, which gets past
+    /// bans, keys, invite-only and limits, ops itself, kicks, and leaves
+    /// again, unless the channel is one of its own. Where it isn't opped, it
+    /// ops itself for the kick and deops itself after it, apart from in a
+    /// channel admins invited it to that it is only now joining, where it
+    /// keeps +o as it always does there.
+    fn kick(&mut self, channel: &str, nick: &str, reason: String) -> Vec<Command> {
+        let key = casemap::fold(channel);
+        let inside = self.joined.contains(&key) && !self.visiting.contains_key(&key);
+        let kick = Command::KICK(channel.to_owned(), nick.to_owned(), Some(reason));
+        if inside && self.has_op(channel) {
+            return vec![kick];
+        }
+
+        let me = self.nick.clone();
+        let mode =
+            |change: &str| Command::SAMODE(channel.to_owned(), change.to_owned(), Some(me.clone()));
+        let own = self
+            .wanted()
+            .iter()
+            .any(|wanted| casemap::eq(wanted, channel));
+        let mut commands = Vec::new();
+        if !inside {
+            commands.push(Command::SAJOIN(me.clone(), channel.to_owned()));
+        }
+        commands.push(mode("+o"));
+        commands.push(kick);
+        if !own {
+            commands.push(Command::PART(channel.to_owned(), None));
+            *self.visiting.entry(key).or_default() += 1;
+        } else if inside || self.room_of(channel).is_some() {
+            commands.push(mode("-o"));
+        }
         commands
     }
 
@@ -1339,6 +1382,12 @@ impl<'a> Session<'a> {
 
     fn lost_channel(&mut self, channel: &str) {
         let key = casemap::fold(channel);
+        if let Some(count) = self.visiting.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                self.visiting.remove(&key);
+            }
+        }
         self.joined.remove(&key);
         self.status.remove(&key);
         self.presence.clear(channel);
@@ -1525,15 +1574,34 @@ mod tests {
         session
     }
 
-    /// The channels and nicks of the SAKICKs lurker sends.
-    fn sakicks(sent: &[Command]) -> Vec<(&str, &str)> {
+    /// The channels and nicks of the kicks lurker sends.
+    fn kicks(sent: &[Command]) -> Vec<(&str, &str)> {
         sent.iter()
             .filter_map(|command| match command {
-                Command::Raw(name, args) if name == "SAKICK" => {
-                    assert!(!args[2].is_empty(), "a kick needs a reason");
-                    Some((args[0].as_str(), args[1].as_str()))
+                Command::KICK(channel, nick, reason) => {
+                    assert!(
+                        reason.as_ref().is_some_and(|reason| !reason.is_empty()),
+                        "a kick needs a reason"
+                    );
+                    Some((channel.as_str(), nick.as_str()))
                 }
                 _ => None,
+            })
+            .collect()
+    }
+
+    /// The commands lurker sends, as short text without kick reasons, such
+    /// as "KICK #wetfish bob".
+    fn shapes(sent: &[Command]) -> Vec<String> {
+        sent.iter()
+            .map(|command| match command {
+                Command::KICK(channel, nick, _) => format!("KICK {channel} {nick}"),
+                Command::SAJOIN(nick, channel) => format!("SAJOIN {nick} {channel}"),
+                Command::SAMODE(channel, mode, Some(nick)) => {
+                    format!("SAMODE {channel} {mode} {nick}")
+                }
+                Command::PART(channel, None) => format!("PART {channel}"),
+                other => format!("{other:?}"),
             })
             .collect()
     }
@@ -2233,8 +2301,17 @@ mod tests {
             ],
         );
         assert_eq!(
-            sakicks(&sent),
+            kicks(&sent),
             [("#wetfish", "bob"), ("#music", "bob"), ("#secret", "bob")]
+        );
+        assert_eq!(
+            shapes(&sent[..4]),
+            [
+                "SAJOIN lurker #wetfish",
+                "SAMODE #wetfish +o lurker",
+                "KICK #wetfish bob",
+                "PART #wetfish",
+            ]
         );
         assert_eq!(
             sent.last(),
@@ -2247,6 +2324,89 @@ mod tests {
         // Looked up again a while later, for channels joined since
         assert!(session.enforce(4000 + SWEEP_INTERVAL - 1).is_empty());
         assert_eq!(session.enforce(4000 + SWEEP_INTERVAL), [whois("bob")]);
+    }
+
+    #[test]
+    fn kicks_as_a_channel_op_wherever_the_lurker_is() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let bob = mark(&db, "bob", Room::Watchlist, Some(HOUR));
+        db.set_warned(bob, 0).unwrap();
+        let mut session = opered(&mut settings, &db);
+        in_wetfish(&mut session, &db, "@", "bob");
+        db.add_channel("#music", "rachel", 0).unwrap();
+        db.add_channel("#art", "rachel", 0).unwrap();
+        feed(&mut session, &[":lurker!lurker@host JOIN #music"]);
+
+        let bob = db.lurker("bob").unwrap().unwrap();
+        let channels =
+            ["#wetfish", "#music", "#purgatory", "#elsewhere", "#art"].map(str::to_owned);
+        let sent = session.sweep(&bob, &channels, 5000);
+        assert_eq!(
+            shapes(&sent),
+            [
+                // Opped already
+                "KICK #wetfish bob",
+                // Not opped: opped just for the kick
+                "SAMODE #music +o lurker",
+                "KICK #music bob",
+                "SAMODE #music -o lurker",
+                // The other room, where lurker never keeps +o
+                "SAMODE #purgatory +o lurker",
+                "KICK #purgatory bob",
+                "SAMODE #purgatory -o lurker",
+                // Not one of lurker's channels: in and out again
+                "SAJOIN lurker #elsewhere",
+                "SAMODE #elsewhere +o lurker",
+                "KICK #elsewhere bob",
+                "PART #elsewhere",
+                // One of its channels that it isn't in yet: it stays opped
+                "SAJOIN lurker #art",
+                "SAMODE #art +o lurker",
+                "KICK #art bob",
+                "SAJOIN bob #FBI_watchlist",
+            ]
+        );
+    }
+
+    #[test]
+    fn joins_a_channel_again_while_still_leaving_it() {
+        let mut settings = oper_settings();
+        let db = Db::open_in_memory();
+        let mut session = opered(&mut settings, &db);
+
+        let first = session.kick("#elsewhere", "bob", "bye".to_owned());
+        assert_eq!(first.len(), 4, "{first:?}");
+        // lurker sees itself join and get +o before it sees itself leave
+        feed(
+            &mut session,
+            &[
+                ":lurker!lurker@host JOIN #elsewhere",
+                ":irc.example.net MODE #elsewhere +o lurker",
+            ],
+        );
+        let second = session.kick("#elsewhere", "carol", "bye".to_owned());
+        assert_eq!(
+            shapes(&second),
+            [
+                "SAJOIN lurker #elsewhere",
+                "SAMODE #elsewhere +o lurker",
+                "KICK #elsewhere carol",
+                "PART #elsewhere",
+            ]
+        );
+
+        // Still leaving after the first part, so a third kick joins again too
+        feed(&mut session, &[":lurker!lurker@host PART #elsewhere"]);
+        feed(&mut session, &[":lurker!lurker@host JOIN #elsewhere"]);
+        let third = session.kick("#elsewhere", "dave", "bye".to_owned());
+        assert_eq!(shapes(&third)[0], "SAJOIN lurker #elsewhere");
+
+        for _ in 0..2 {
+            feed(&mut session, &[":lurker!lurker@host PART #elsewhere"]);
+        }
+        assert!(session.visiting.is_empty());
+        assert!(session.rejoin().is_empty(), "it doesn't come back");
     }
 
     #[test]
@@ -2272,8 +2432,14 @@ mod tests {
                 ":irc.example.net 318 lurker bob :End of /WHOIS list.",
             ],
         );
-        assert_eq!(sakicks(&sent), [("#wetfish", "bob")]);
-        assert_eq!(sent.len(), 1, "no sajoin: {sent:?}");
+        assert_eq!(kicks(&sent), [("#wetfish", "bob")]);
+        assert!(
+            !sent.contains(&Command::SAJOIN(
+                "bob".to_owned(),
+                "#FBI_watchlist".to_owned()
+            )),
+            "no sajoin: {sent:?}"
+        );
     }
 
     #[test]
@@ -2294,7 +2460,7 @@ mod tests {
         session.swept.insert(bob, 4100);
         let sent = feed_at(&mut session, 4200, &[":bob!~b@h JOIN #FBI_watchlist"]);
         assert!(
-            sakicks(&sent).is_empty() && !sent.contains(&whois("bob")),
+            kicks(&sent).is_empty() && !sent.contains(&whois("bob")),
             "{sent:?}"
         );
     }

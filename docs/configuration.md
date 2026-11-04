@@ -63,13 +63,13 @@ name = "lurker"
 password = "the plain password"
 ```
 
-The IRC server runs InspIRCd 3.9 with `m_sajoin`, `m_sakick` and `m_samode`
-loaded. lurker's oper block in `opers.conf` needs these commands and
-privileges, and nothing more:
+The IRC server runs InspIRCd 3.9 with `m_sajoin` and `m_samode` loaded.
+lurker's oper block in `opers.conf` needs these commands and privileges, and
+nothing more:
 
 ```text
 <class name="LurkerBot"
-     commands="SAJOIN SAKICK SAMODE"
+     commands="SAJOIN SAMODE"
      privs="users/sajoin-others users/channel-spy channels/auspex">
 
 <type name="Lurker_Bot" classes="LurkerBot" vhost="lurkers.wetfish.net">
@@ -84,10 +84,11 @@ privileges, and nothing more:
 
 | Needed | For |
 | --- | --- |
-| `SAKICK` | Kicking lurkers from channels lurker isn't in |
-| `SAJOIN` and `users/sajoin-others` | Sajoining lurkers into their room |
-| `SAMODE` | Giving itself +o in its channels |
+| `SAJOIN` and `users/sajoin-others` | Sajoining lurkers into their room, and itself into any channel a lurker is in, past bans, keys and invite-only, to kick them there |
+| `SAMODE` | Giving itself +o in its channels, and wherever it kicks a lurker |
 | `users/channel-spy` | Seeing a lurker's secret and private channels, so it kicks them from those too |
 | `channels/auspex` | Seeing everyone in `+u` (auditorium) channels |
 
-Opers with snomask `a` see a notice for every SAKICK and SAJOIN.
+lurker kicks as a channel op rather than with SAKICK, because the Matrix
+bridge only removes a Matrix user from the matching room for a kick by a
+user. Opers with snomask `a` see a notice for every SAJOIN and SAMODE.

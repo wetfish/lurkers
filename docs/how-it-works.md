@@ -20,10 +20,13 @@ period, wherever they are:
    there after their grace period. It warns them in one of its channels if
    they are in one, and otherwise in a private message.
 2. **Kicks:** once the grace period after the warning is over, lurker kicks
-   them, with SAKICK, from every channel they are in apart from their room,
-   including secret ones, then sajoins them into their room. It does this
-   again every 5 minutes while they are online, and straight away when they
-   join one of lurker's channels, so they can't settle anywhere else.
+   them from every channel they are in apart from their room, including
+   secret ones, then sajoins them into their room. It kicks as a channel op,
+   so the Matrix bridge also removes Matrix users from the matching room,
+   which it doesn't for a SAKICK. In a channel it isn't in, it sajoins
+   itself, ops itself, kicks and leaves again. It does this again every 5
+   minutes while they are online, and straight away when they join one of
+   lurker's channels, so they can't settle anywhere else.
 3. **Release:** a lurker who says something after their warning, in any
    channel lurker is in, isn't kicked any more. Marking them again with
    `grace=` starts over with a new warning.
@@ -70,7 +73,8 @@ after a kick or a ban.
 As an IRC operator, lurker gives itself +o with SAMODE in each of these
 channels where it isn't opped, but not in its rooms. If someone takes +o
 away, it waits 10 minutes before taking it back, so it never fights anyone
-over it.
+over it. To kick a lurker where it isn't opped, it ops itself for the kick
+and deops itself straight after.
 
 ## Staying connected
 
